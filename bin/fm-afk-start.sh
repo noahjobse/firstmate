@@ -88,18 +88,29 @@ daemon_lock_owner() {
 # different process, and 2 when the recorded identity cannot be identified at all
 # (fm_pid_matches_identity): a daemon that fingerprinted itself before an in-place
 # update records its identity in a format this code no longer produces.
+#
+# A lock with NO recorded identity predates atomic staging: today's daemon stages a
+# non-empty fingerprint into its owner dir before publishing the lock, or fails to
+# take the lock at all (stage_daemon_lock_meta). Such a holder is attributed the way
+# every other supervisor is - it must be EXECUTING this home's daemon script, and its
+# own environment must resolve to this home and state dir. A substring match over the
+# command line would also vouch for a process that merely NAMES the script (a crewmate
+# whose brief quotes the path, an editor, a tail), which is the `-f`-match hazard
+# AGENTS.md section 8 forbids: callers SIGTERM the pid this vouches for, and reading a
+# recycled pid as the daemon would both kill a stranger and leave away-mode
+# supervision silently unarmed. A live holder that cannot be attributed at all (no
+# /proc, so its home is unreadable) is unidentifiable, never reclaimed.
 daemon_pid_matches() {
-  local pid=$1 owner=$2 identity command rc=0
+  local pid=$1 owner=$2 identity rc=0
   identity=$(cat "$owner/pid-identity" 2>/dev/null || true)
   if [ -n "$identity" ]; then
     fm_pid_matches_identity "$pid" "$identity" || rc=$?
     return "$rc"
   fi
-  command=$(ps -p "$pid" -o command= 2>/dev/null || true)
-  case "$command" in
-    *"$FM_AFK_DAEMON"*|*"fm-supervise-daemon.sh"*) return 0 ;;
-  esac
-  return 1
+  fm_pid_runs_command "$pid" "$FM_AFK_DAEMON" || return 1
+  fm_pid_home_readable "$pid" || return 2
+  fm_pid_home_matches "$pid" "$FM_HOME" "$FM_AFK_STATE" || return 1
+  return 0
 }
 
 daemon_lock_pid() {
