@@ -30,6 +30,7 @@ If work is in flight, it requires `fm_watcher_healthy <state-dir> <watch-path> [
 That is the same identity-matched live lock and fresh beacon check used by `bin/fm-watch-arm.sh`.
 A stale beacon blocks even if a watcher pid is still live.
 A fresh leftover beacon blocks if the watcher lock is missing, dead, or identity-mismatched.
+The predicate trusts the lock's recorded identity, so the lock must never be observable half-written or torn; watchers therefore publish their identity atomically, as described in [architecture.md](architecture.md#event-driven-supervision) and [docs/incidents/2026-07-12-torn-watcher-lock.md](incidents/2026-07-12-torn-watcher-lock.md), where a non-atomic lock made this guard fire on nearly every turn of a healthy session.
 
 `FM_STATE_OVERRIDE` wins over `FM_HOME/state`, and `FM_HOME` wins over repo-root `state/`.
 `FM_GUARD_GRACE` controls the beacon freshness window and defaults to 300 seconds.

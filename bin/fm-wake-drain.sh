@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Atomically drain durable watcher wake records, then assert watcher liveness.
+# Contention for the queue lock is waited out, but a state dir this home cannot
+# lock at all is fatal: the queue is NOT drained, and the script says so and exits
+# non-zero rather than blocking forever or draining unlocked.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

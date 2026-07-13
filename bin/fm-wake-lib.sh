@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 # Shared durable wake queue and portable lock helpers.
+# A lock holder that carries identity metadata (the watcher, the away-mode daemon)
+# passes a stage function to fm_lock_try_create/fm_lock_try_acquire so that
+# identity is written into the owner dir BEFORE the lock symlink publishes it; a
+# holder must never write lock metadata through the lock path afterwards. See
+# fm_lock_stage_owner_meta and docs/incidents/2026-07-12-torn-watcher-lock.md.
+# The acquire helpers distinguish three outcomes: 0 held, 1 lost to another holder
+# (FM_LOCK_HELD_PID), and 2 when this holder could not build a lock at all
+# (FM_LOCK_STAGE_FAILED) - which is our own failure, not contention, and callers
+# must fail loudly on it rather than stand down.
 
 FM_WAKE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_WAKE_DEFAULT_ROOT="$(cd "$FM_WAKE_LIB_DIR/.." && pwd)"

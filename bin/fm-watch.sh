@@ -36,7 +36,12 @@
 #                          status, unless afk is active
 # For normal supervision, resume the session-start primary-harness protocol
 # after each printed reason. Direct duplicate invocations of this script still
-# no-op through the watcher singleton lock.
+# no-op through the watcher singleton lock, printing "watcher: already running"
+# and exiting 0 - but only when a lock actually exists. Failing to build a lock
+# of our own (an unwritable or full state dir, ps unavailable to the identity
+# stage hook) is not contention: it prints "watcher: FAILED" and exits non-zero,
+# because nobody holds the lock and supervision would otherwise be left unarmed
+# while the caller believed it was live.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
