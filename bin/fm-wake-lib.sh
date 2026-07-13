@@ -206,6 +206,23 @@ fm_path_canonical_file_if_absolute() {
   esac
 }
 
+# Path equality, byte compare first. Two spellings of one path must compare equal
+# (that is what the canonical forms above are for), but the overwhelmingly common
+# case is that both sides were written by this home and are already byte-identical
+# - and these compares sit in the supervision hot path (fm_watcher_healthy runs on
+# every guard call and on every poll of an attached arm), where each canonical
+# form costs a basename, a dirname and a subshell. So canonicalise only when the
+# literal compare fails; the accepted set is unchanged.
+fm_path_same_dir() {
+  [ "$1" = "$2" ] && return 0
+  [ "$(fm_path_canonical "$1")" = "$(fm_path_canonical "$2")" ]
+}
+
+fm_path_same_file() {
+  [ "$1" = "$2" ] && return 0
+  [ "$(fm_path_canonical_file "$1")" = "$(fm_path_canonical_file "$2")" ]
+}
+
 fm_path_mtime() {
   if [ "$(uname)" = Darwin ]; then
     stat -f %m "$1" 2>/dev/null
@@ -374,8 +391,8 @@ fm_pid_home_matches() {
   fm_pid_alive "$pid" || return 1
   fm_pid_home_readable "$pid" || return 1
   pid_home=$(fm_pid_resolved_home "$pid" "$default_root")
-  [ "$(fm_path_canonical "$pid_home")" = "$(fm_path_canonical "$home")" ] || return 1
-  [ "$(fm_path_canonical "$(fm_pid_resolved_state "$pid" "$pid_home")")" = "$(fm_path_canonical "$state")" ]
+  fm_path_same_dir "$pid_home" "$home" || return 1
+  fm_path_same_dir "$(fm_pid_resolved_state "$pid" "$pid_home")" "$state"
 }
 
 # 0 when the lock positively vouches for <pid> as this home's watcher, 2 when the
@@ -390,8 +407,8 @@ fm_watcher_lock_matches_pid() {
   lock_path=$(cat "$lockdir/watcher-path" 2>/dev/null || true)
   lock_identity=$(cat "$lockdir/pid-identity" 2>/dev/null || true)
   [ -n "$lock_path" ] || return 1
-  [ "$(fm_path_canonical "$lock_home")" = "$(fm_path_canonical "$home")" ] || return 1
-  [ "$(fm_path_canonical_file "$lock_path")" = "$(fm_path_canonical_file "$watch_path")" ] || return 1
+  fm_path_same_dir "$lock_home" "$home" || return 1
+  fm_path_same_file "$lock_path" "$watch_path" || return 1
   [ -n "$lock_identity" ] || return 1
   fm_pid_matches_identity "$pid" "$lock_identity"
 }

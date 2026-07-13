@@ -85,8 +85,8 @@ clear_stale_recorded_watcher_lock() {
   lock_path=$(cat "$WATCH_LOCK/watcher-path" 2>/dev/null || true)
   lock_identity=$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)
   [ -n "$lock_path" ] || return 0
-  [ "$(fm_path_canonical "$lock_home")" = "$(fm_path_canonical "$FM_HOME")" ] || return 0
-  [ "$(fm_path_canonical_file "$lock_path")" = "$(fm_path_canonical_file "$WATCH")" ] || return 0
+  fm_path_same_dir "$lock_home" "$FM_HOME" || return 0
+  fm_path_same_file "$lock_path" "$WATCH" || return 0
   [ -n "$lock_identity" ] || return 0
   fm_lock_remove_path "$WATCH_LOCK" || true
 }
