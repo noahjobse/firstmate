@@ -1276,7 +1276,16 @@ fm_super_main() {
   # --- single instance (portable lock, no flock dependency) ------------------
   # Identity is staged into the owner dir before the lock publishes, never written
   # through the lock path afterwards; see fm_lock_stage_owner_meta.
-  if ! fm_lock_try_acquire "$LOCK" stage_daemon_lock_meta; then
+  local lock_rc
+  fm_lock_try_acquire "$LOCK" stage_daemon_lock_meta
+  lock_rc=$?
+  if [ "$lock_rc" -eq 2 ]; then
+    # Our own staging failed: nobody holds the lock, so this is not contention and
+    # must not be reported as another daemon running.
+    echo "error: could not stage the daemon lock identity for $LOCK (state dir unwritable, or ps unavailable)" >&2
+    exit 1
+  fi
+  if [ "$lock_rc" -ne 0 ]; then
     if [ -n "${FM_LOCK_HELD_PID:-}" ]; then
       echo "error: another fm-supervise-daemon is already running (pid $FM_LOCK_HELD_PID, lock $LOCK held)" >&2
     else

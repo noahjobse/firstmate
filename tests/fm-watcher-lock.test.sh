@@ -824,9 +824,89 @@ test_restart_stops_a_live_watcher_behind_a_torn_lock() {
   pass "restart stops a live watcher behind a torn lock instead of orphaning it"
 }
 
+test_restart_never_kills_a_sibling_homes_watcher() {
+  # The cross-home hazard. bin/fm-watch.sh is the SAME script in every firstmate
+  # home, so a stale pid THIS home recorded, recycled by the OS onto a SIBLING
+  # home's live watcher, matches on command path alone. Restart must positively
+  # attribute the pid to this home before signalling it: the sibling's supervision
+  # must survive, and this home must still repair itself.
+  local dir sibling state fakebin armout sibling_pid armpid i lock_pid
+  dir=$(make_case restart-sibling-home)
+  sibling=$(make_case restart-sibling-home-peer)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/arm.out"
+  # A real watcher, living in ANOTHER home, holding that home's own lock.
+  PATH="$fakebin:$PATH" FM_HOME="$sibling" FM_POLL=30 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$sibling/watch.out" &
+  sibling_pid=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    [ "$(cat "$sibling/state/.watch.lock/pid" 2>/dev/null || true)" = "$sibling_pid" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ "$(cat "$sibling/state/.watch.lock/pid" 2>/dev/null || true)" = "$sibling_pid" ] \
+    || fail "sibling home's watcher did not take its own lock"
+  # THIS home's lock records that pid (recycled), with an identity that no longer
+  # matches it - the exact shape that makes the command-path match the only arm left.
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$sibling_pid" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "stale watcher identity" > "$state/.watch.lock/pid-identity"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" --restart > "$armout" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    grep -qF 'watcher: started pid=' "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  is_live_non_zombie "$sibling_pid" \
+    || fail "restart killed a SIBLING home's watcher off a recycled pid (cross-home kill)"
+  [ "$(cat "$sibling/state/.watch.lock/pid" 2>/dev/null || true)" = "$sibling_pid" ] \
+    || fail "restart disturbed the sibling home's own lock"
+  lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  { [ -n "$lock_pid" ] && [ "$lock_pid" != "$sibling_pid" ] && kill -0 "$lock_pid" 2>/dev/null; } \
+    || fail "restart did not repair this home's supervision with its own live watcher (got '$lock_pid')"
+  grep -F "watcher: started pid=$lock_pid" "$armout" >/dev/null \
+    || fail "restart did not report the fresh watcher it confirmed"
+  kill "$armpid" "$lock_pid" "$sibling_pid" 2>/dev/null || true
+  wait "$armpid" 2>/dev/null || true
+  wait "$sibling_pid" 2>/dev/null || true
+  pass "restart repairs this home without killing a sibling home's watcher"
+}
+
+test_watch_fails_loudly_when_lock_staging_fails() {
+  # A staging failure is OUR failure, not contention: no lock exists and no watcher
+  # is running. The watcher must never report it as "already running" and exit 0,
+  # which would leave supervision unarmed while the caller believed it was live.
+  local dir state fakebin out status
+  dir=$(make_case watch-stage-fail)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  # ps missing makes fm_pid_identity - and so the watcher's stage hook - fail.
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$fakebin/ps"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" 2>&1
+  status=$?
+  [ "$status" -ne 0 ] || fail "watcher exited zero when it could not stage its lock identity: $(cat "$out")"
+  ! grep -qF 'watcher: already running' "$out" \
+    || fail "staging failure was reported as another watcher already running: $(cat "$out")"
+  grep -qF 'watcher: FAILED' "$out" || fail "staging failure was not reported loudly: $(cat "$out")"
+  [ ! -e "$state/.watch.lock" ] || fail "failed staging left a lock behind"
+  pass "watcher fails loudly when it cannot stage its lock identity"
+}
+
 test_singleton_start
 test_pid_identity_is_locale_invariant
 test_lock_metadata_is_staged_before_the_lock_is_published
+test_restart_never_kills_a_sibling_homes_watcher
+test_watch_fails_loudly_when_lock_staging_fails
 test_watch_lock_names_its_own_watcher_from_a_clean_environment
 test_restart_stops_a_live_watcher_behind_a_torn_lock
 test_stale_watch_lock_reclaimed

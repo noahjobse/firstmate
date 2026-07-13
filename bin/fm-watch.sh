@@ -596,7 +596,16 @@ stage_watch_lock_meta() {
   [ -s "$ownerdir/pid-identity" ]
 }
 
-if ! fm_lock_try_acquire "$WATCH_LOCK" stage_watch_lock_meta; then
+fm_lock_try_acquire "$WATCH_LOCK" stage_watch_lock_meta
+lock_rc=$?
+if [ "$lock_rc" -eq 2 ]; then
+  # Staging failed, so no lock exists and no watcher is running anywhere. This is
+  # not contention: reporting it as "already running" and exiting zero would leave
+  # supervision silently unarmed while the caller believed it was live.
+  echo "watcher: FAILED - could not stage the watcher lock identity in $STATE (state dir unwritable, or ps unavailable)" >&2
+  exit 1
+fi
+if [ "$lock_rc" -ne 0 ]; then
   BEAT="$STATE/.last-watcher-beat"
   if [ -n "${FM_LOCK_HELD_PID:-}" ]; then
     if [ -e "$BEAT" ]; then
@@ -616,8 +625,8 @@ if ! fm_lock_try_acquire "$WATCH_LOCK" stage_watch_lock_meta; then
   exit 0
 fi
 trap 'fm_lock_release "$WATCH_LOCK"' EXIT
-# This watcher's own pid, as recorded in the lock by fm_lock_claim (which writes
-# ${BASHPID:-$$} from this same main shell). Read directly, never via a command
+# This watcher's own pid, as recorded in the lock by fm_lock_prepare_owner (which
+# writes ${BASHPID:-$$} from this same main shell). Read directly, never via a command
 # substitution, so it matches the stored holder pid for the self-eviction check.
 WATCHER_PID=${BASHPID:-$$}
 

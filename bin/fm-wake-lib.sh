@@ -60,6 +60,65 @@ fm_pid_runs_command() {
   return 1
 }
 
+# Read one variable out of another process's OWN environment. Linux-only: where
+# /proc is unavailable (macOS) or the environ is unreadable, this fails, and
+# callers must treat that as "cannot attribute" rather than as a match.
+fm_pid_env_value() {
+  local pid=$1 name=$2 environ entry
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ -n "$name" ] || return 1
+  environ="/proc/$pid/environ"
+  [ -r "$environ" ] || return 1
+  while IFS= read -r -d '' entry; do
+    case "$entry" in
+      "$name"=*)
+        printf '%s\n' "${entry#"$name"=}"
+        return 0
+        ;;
+    esac
+  done < "$environ"
+  return 1
+}
+
+# Positively attribute a live pid to a firstmate home, resolving the home the way
+# this library resolves its own (FM_HOME, then FM_ROOT_OVERRIDE, then FM_ROOT,
+# then the default root of the script the process runs). Callers use this before
+# signalling a process they matched only by command path: bin/fm-watch.sh is
+# SHARED by every home, secondmates included, so a command match alone cannot
+# distinguish this home's watcher from a sibling's - the cross-home hazard
+# AGENTS.md warns about with `pkill -f bin/fm-watch.sh`. A process whose home
+# cannot be positively read (no /proc) is unattributable and must never be
+# signalled.
+# Whether a process's home can be read at all here. False means unattributable
+# (no /proc, or a foreign-owner environ we may not read), never "different home".
+fm_pid_home_readable() {
+  local pid=$1
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ -r "/proc/$pid/environ" ]
+}
+
+fm_pid_home_matches() {
+  local pid=$1 home=$2 default_root=${3:-$FM_WAKE_DEFAULT_ROOT} name value
+  [ -n "$home" ] || return 1
+  fm_pid_alive "$pid" || return 1
+  fm_pid_home_readable "$pid" || return 1
+  for name in FM_HOME FM_ROOT_OVERRIDE FM_ROOT; do
+    if value=$(fm_pid_env_value "$pid" "$name"); then
+      [ -n "$value" ] || continue
+      [ "$value" = "$home" ]
+      return
+    fi
+  done
+  # The environ is readable and carries no home override, so the process runs in
+  # the default home of the script it executes - which the caller has already
+  # matched against this home's own script path.
+  [ "$home" = "$default_root" ]
+}
+
 fm_watcher_lock_matches_pid() {
   local state=$1 watch_path=$2 pid=$3 home=${4:-$FM_HOME} lockdir lock_home lock_path lock_identity current_identity
   lockdir="$state/.watch.lock"
@@ -165,11 +224,20 @@ fm_lock_claim_blocked_by_steal() {
 fm_lock_claim() {
   local lockdir=$1 ownerdir=$2 allowed_steal_owner=${3:-} mypid back
   mypid=${BASHPID:-$$}
-  if ! { printf '%s\n' "$mypid" > "$ownerdir/pid"; } 2>/dev/null; then
-    fm_lock_discard_owner "$ownerdir"
-    return 1
-  fi
   back=$(cat "$ownerdir/pid" 2>/dev/null || true)
+  # On the try_create path the owner dir is already published behind the lock
+  # symlink and fm_lock_prepare_owner already recorded this pid. Rewriting it
+  # would truncate a file readers reach through the lock, and a reader landing in
+  # that window would see an empty pid - which every consumer reads as "no live
+  # holder". Holders never write into a published owner dir; only a late claimant
+  # of an owner dir it prepared itself (and has not published) writes here.
+  if [ "$back" != "$mypid" ]; then
+    if ! { printf '%s\n' "$mypid" > "$ownerdir/pid"; } 2>/dev/null; then
+      fm_lock_discard_owner "$ownerdir"
+      return 1
+    fi
+    back=$(cat "$ownerdir/pid" 2>/dev/null || true)
+  fi
   if [ "$back" != "$mypid" ]; then
     fm_lock_discard_owner "$ownerdir"
     return 1
@@ -204,6 +272,12 @@ fm_lock_stage_owner_meta() {
   "$stage_fn" "$ownerdir"
 }
 
+# Returns 0 when the lock is held, 2 when this holder's own staging failed (an
+# unwritable state dir, ps unavailable), and 1 for every ordinary loss to another
+# holder. A staging failure is OUR problem, not contention, and callers must not
+# report it as "someone else holds the lock": the lock does not exist and nothing
+# is running, so a caller that mistook it for contention would exit quietly and
+# leave supervision unarmed.
 fm_lock_try_create() {
   local lockdir=$1 allowed_steal_owner=${2:-} stage_fn=${3:-} ownerdir
   FM_LOCK_OWNER_DIR=
@@ -218,7 +292,8 @@ fm_lock_try_create() {
   fi
   if ! fm_lock_stage_owner_meta "$ownerdir" "$stage_fn"; then
     fm_lock_discard_owner "$ownerdir"
-    return 1
+    FM_LOCK_STAGE_FAILED=1
+    return 2
   fi
   if ln -s "$ownerdir" "$lockdir" 2>/dev/null && fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
     if fm_lock_claim "$lockdir" "$ownerdir" "$allowed_steal_owner"; then
@@ -283,13 +358,21 @@ fm_lock_recheck_stale_owner() {
 # before the lock is published (see fm_lock_stage_owner_meta). It is deliberately
 # NOT passed to the internal steal mutex below: that is a different lock with no
 # identity of its own.
+# Returns 0 held, 2 staging failed (FM_LOCK_STAGE_FAILED is set; the lock is NOT
+# held by anyone), 1 lost to the holder in FM_LOCK_HELD_PID.
 fm_lock_try_acquire() {
-  local lockdir=$1 stage_fn=${2:-} pid steal cur rc steal_owner primary_owner
+  local lockdir=$1 stage_fn=${2:-} pid steal cur rc steal_owner primary_owner create_rc
   FM_LOCK_HELD_PID=
   FM_LOCK_OWNER_DIR=
+  FM_LOCK_STAGE_FAILED=
 
-  if fm_lock_try_create "$lockdir" '' "$stage_fn"; then
+  fm_lock_try_create "$lockdir" '' "$stage_fn"
+  create_rc=$?
+  if [ "$create_rc" -eq 0 ]; then
     return 0
+  fi
+  if [ "$create_rc" -eq 2 ]; then
+    return 2
   fi
 
   pid=$(cat "$lockdir/pid" 2>/dev/null || true)
@@ -343,9 +426,12 @@ fm_lock_try_acquire() {
   fi
 
   fm_lock_remove_path "$lockdir" || true
-  rc=1
-  if fm_lock_try_create "$lockdir" "$steal_owner" "$stage_fn"; then
-    rc=0
+  fm_lock_try_create "$lockdir" "$steal_owner" "$stage_fn"
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    fm_lock_release "$steal"
+    FM_LOCK_OWNER_DIR=
+    return 2
   fi
   if [ "$rc" -ne 0 ]; then
     # shellcheck disable=SC2034 # Read by callers after fm_lock_try_acquire returns.
