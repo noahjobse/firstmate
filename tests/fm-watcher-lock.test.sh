@@ -446,7 +446,11 @@ test_watch_restart_reports_healthy_peer_without_attaching() {
   touch "$state/.last-watcher-beat"
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_ARM_ATTACH_POLL=0.1 "$WATCH_ARM" --restart > "$out" &
   armpid=$!
-  wait_for_exit "$armpid" 80
+  # The peer ignores TERM on purpose, so restart always burns its full bounded
+  # stop-wait (50 x 0.1s) before it forks and confirms the stand-down child.
+  # The budget must clear that floor with room to spare or a loaded machine times
+  # the arm out before it can report healthy.
+  wait_for_exit "$armpid" 200
   status=$?
   [ "$status" -eq 0 ] || fail "restart did not exit zero after reporting healthy peer (status $status): $(cat "$out")"
   grep -qF "watcher: healthy pid=$peer" "$out" || fail "restart did not report the healthy peer: $(cat "$out")"
@@ -709,6 +713,31 @@ test_pid_identity_is_locale_invariant() {
   [ "$via_lc_all" = "$baseline" ] || fail "fm_pid_identity varied with exported LC_ALL (got '$via_lc_all', want '$baseline')"
   [ "$via_lc_time" = "$baseline" ] || fail "fm_pid_identity varied with exported LC_TIME (got '$via_lc_time', want '$baseline')"
   pass "fm_pid_identity is locale-invariant across LC_ALL/LC_TIME"
+}
+
+test_pid_identity_is_stable_across_reads() {
+  # The identity is a fingerprint of ONE live process instance, so the same live pid
+  # must fingerprint byte-identically every time or the lock's own holder eventually
+  # reads as a reused pid and supervision reports itself down while a watcher is
+  # running. ps's lstart is recomputed from a boot-time estimate on every invocation
+  # and drifts by a second on a clock-adjusting host (WSL2), so the identity must not
+  # be derived from it where the kernel's own start ticks are readable.
+  local live baseline current i
+  sleep 300 &
+  live=$!
+  baseline=$(bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live" 2>/dev/null)
+  [ -n "$baseline" ] || fail "fm_pid_identity produced no identity for a live pid"
+  i=0
+  while [ "$i" -lt 20 ]; do
+    current=$(bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live" 2>/dev/null)
+    [ "$current" = "$baseline" ] \
+      || fail "fm_pid_identity is not stable across reads of one live pid (got '$current', want '$baseline')"
+    sleep 0.1
+    i=$((i + 1))
+  done
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  pass "fm_pid_identity is byte-stable across repeated reads of one live pid"
 }
 
 test_lock_metadata_is_staged_before_the_lock_is_published() {
@@ -1101,6 +1130,7 @@ test_pid_home_matches_separates_state_override_domains() {
 
 test_singleton_start
 test_pid_identity_is_locale_invariant
+test_pid_identity_is_stable_across_reads
 test_lock_acquire_fails_closed_on_an_unwritable_state_dir
 test_watch_fails_loudly_when_the_state_dir_is_unwritable
 test_pid_runs_command_matches_only_the_program_being_run
