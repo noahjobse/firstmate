@@ -47,6 +47,15 @@
 # bin/fm-watch.sh`: that pattern matches every firstmate home's watcher
 # (secondmate homes run the same script) and would kill siblings. Restart never
 # takes the attach path.
+#
+# Attributing a pid to a home reads that process's own environment through /proc,
+# so it is Linux-only. On macOS a live holder behind a LEGACY torn lock (one
+# written by a pre-fix firstmate) can be neither attributed nor safely signalled,
+# so --restart leaves both the process and its lock untouched and the home reports
+# FAILED until that watcher is stopped by hand once. Torn locks can no longer form
+# once identity is published atomically (fm_lock_stage_owner_meta), so this affects
+# only a lock left on disk by an older version. See
+# docs/incidents/2026-07-12-torn-watcher-lock.md.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -599,10 +599,18 @@ stage_watch_lock_meta() {
 fm_lock_try_acquire "$WATCH_LOCK" stage_watch_lock_meta
 lock_rc=$?
 if [ "$lock_rc" -eq 2 ]; then
-  # Staging failed, so no lock exists and no watcher is running anywhere. This is
-  # not contention: reporting it as "already running" and exiting zero would leave
-  # supervision silently unarmed while the caller believed it was live.
-  echo "watcher: FAILED - could not stage the watcher lock identity in $STATE (state dir unwritable, or ps unavailable)" >&2
+  # We could not build a lock of our own (unwritable or full state dir, mktemp
+  # failing, ps unavailable to the stage hook), so no lock exists and no watcher is
+  # running anywhere. This is not contention: reporting it as "already running" and
+  # exiting zero would leave supervision silently unarmed while the caller believed
+  # it was live.
+  echo "watcher: FAILED - could not create the watcher lock in $STATE (state dir unwritable or full, or ps unavailable)" >&2
+  exit 1
+fi
+if [ "$lock_rc" -ne 0 ] && [ ! -e "$WATCH_LOCK" ] && [ ! -L "$WATCH_LOCK" ]; then
+  # Lost the lock, yet no lock exists: nobody is holding supervision and we armed
+  # nothing. Never report this as "already running".
+  echo "watcher: FAILED - could not acquire the watcher lock in $STATE and no lock is present; supervision is NOT armed" >&2
   exit 1
 fi
 if [ "$lock_rc" -ne 0 ]; then

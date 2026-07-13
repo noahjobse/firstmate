@@ -15,6 +15,14 @@ LIB="$ROOT/bin/fm-wake-lib.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-watcher-lock-tests)
 
+# Restart can only signal a holder it can positively attribute to this home, and
+# that reads the target's own environment through /proc. Where /proc is absent
+# (macOS) the arm deliberately refuses to kill, so the restart-behavior tests
+# below have nothing to assert and skip instead of failing.
+home_attribution_available() {
+  [ -r "/proc/$$/environ" ]
+}
+
 
 test_singleton_start() {
   local dir state fakebin out1 out2 pid1 pid2 live i
@@ -779,6 +787,10 @@ test_restart_stops_a_live_watcher_behind_a_torn_lock() {
   # fresh one over a lock neither owns, which is how a false alarm became a real
   # supervision outage.
   local dir state fakebin out armout pid armpid i lock_pid stranger
+  home_attribution_available || {
+    echo "skip: restart's home attribution needs /proc (Linux); on macOS restart neither stops nor clears a live holder behind a legacy torn lock"
+    return 0
+  }
   dir=$(make_case restart-torn-lock)
   state="$dir/state"
   fakebin="$dir/fakebin"
@@ -831,6 +843,10 @@ test_restart_never_kills_a_sibling_homes_watcher() {
   # attribute the pid to this home before signalling it: the sibling's supervision
   # must survive, and this home must still repair itself.
   local dir sibling state fakebin armout sibling_pid armpid i lock_pid
+  home_attribution_available || {
+    echo "skip: restart's home attribution needs /proc (Linux); on macOS an unattributable holder is never signalled at all"
+    return 0
+  }
   dir=$(make_case restart-sibling-home)
   sibling=$(make_case restart-sibling-home-peer)
   state="$dir/state"
@@ -902,8 +918,111 @@ SH
   pass "watcher fails loudly when it cannot stage its lock identity"
 }
 
+test_lock_acquire_fails_closed_on_an_unwritable_state_dir() {
+  # An unwritable (or full) state dir fails before any staging: mktemp cannot make
+  # the owner dir. That must be the SAME own-failure outcome as a stage failure
+  # (rc 2, no holder pid), never "someone else holds the lock" - and it must never
+  # descend into the steal path, whose lock lives in the same unwritable dir and
+  # would recurse (lock.steal -> lock.steal.steal -> ...) without bound.
+  local dir state out rc
+  [ "$(id -u)" -ne 0 ] || { echo "skip: running as root, an unwritable dir is still writable"; return 0; }
+  dir=$(make_case lock-unwritable-state)
+  state="$dir/state"
+  chmod 500 "$state"
+  out=$(timeout 20 env FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_lock_try_acquire "$2/.contend.lock"
+    printf "rc=%s held=%s staged_failed=%s\n" "$?" "${FM_LOCK_HELD_PID:-}" "${FM_LOCK_STAGE_FAILED:-}"
+  ' _ "$LIB" "$state" 2>&1)
+  rc=$?
+  chmod 700 "$state"
+  [ "$rc" -eq 0 ] || fail "acquire on an unwritable state dir did not terminate cleanly (rc=$rc): $out"
+  case "$out" in
+    *"rc=2 held= staged_failed=1"*) ;;
+    *) fail "unwritable state dir was not reported as an own failure: $out" ;;
+  esac
+  case "$out" in
+    *"recursion"*|*"FUNCNEST"*) fail "acquire recursed on an unwritable state dir: $out" ;;
+  esac
+  pass "lock acquire fails closed (rc 2, no holder) on an unwritable state dir instead of recursing"
+}
+
+test_watch_fails_loudly_when_the_state_dir_is_unwritable() {
+  # Same cause, seen from the watcher: no lock exists and nothing was armed, so it
+  # must exit non-zero and say so, never "already running".
+  local dir state fakebin out status
+  [ "$(id -u)" -ne 0 ] || { echo "skip: running as root, an unwritable dir is still writable"; return 0; }
+  dir=$(make_case watch-unwritable-state)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  chmod 500 "$state"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 timeout 20 "$WATCH" > "$out" 2>&1
+  status=$?
+  chmod 700 "$state"
+  [ "$status" -ne 124 ] || fail "watcher hung (unbounded recursion?) on an unwritable state dir: $(cat "$out")"
+  [ "$status" -ne 0 ] || fail "watcher exited zero when it could not create its lock: $(cat "$out")"
+  ! grep -qF 'watcher: already running' "$out" \
+    || fail "an unwritable state dir was reported as another watcher already running: $(cat "$out")"
+  grep -qF 'watcher: FAILED' "$out" || fail "unwritable state dir was not reported loudly: $(cat "$out")"
+  [ ! -e "$state/.watch.lock" ] || fail "failed acquire left a lock behind"
+  pass "watcher fails loudly when an unwritable state dir prevents it from creating its lock"
+}
+
+test_pid_runs_command_matches_only_the_program_being_run() {
+  # The restart arm signals what this vouches for, so it must mean "this pid is
+  # EXECUTING that script", not "that path appears somewhere in its arguments" - a
+  # tail or editor on bin/fm-watch.sh must never be mistaken for the watcher.
+  local dir tail_pid sleeper_pid probe
+  dir=$(make_case pid-runs-command)
+  probe='. "$1"; if fm_pid_runs_command "$2" "$3"; then echo match; else echo nomatch; fi'
+  tail -f "$WATCH" > /dev/null 2>&1 &
+  tail_pid=$!
+  sleep 0.2
+  [ "$(FM_STATE_OVERRIDE="$dir/state" bash -c "$probe" _ "$LIB" "$tail_pid" "$WATCH")" = nomatch ] \
+    || fail "a process merely reading $WATCH matched as running it (it would be SIGTERMed off a recycled pid)"
+  kill "$tail_pid" 2>/dev/null || true
+  wait "$tail_pid" 2>/dev/null || true
+  PATH="$dir/fakebin:$PATH" FM_STATE_OVERRIDE="$dir/state" FM_POLL=30 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$dir/watch.out" 2>&1 &
+  sleeper_pid=$!
+  sleep 0.5
+  [ "$(FM_STATE_OVERRIDE="$dir/state" bash -c "$probe" _ "$LIB" "$sleeper_pid" "$WATCH")" = match ] \
+    || fail "the real watcher process did not match its own script path"
+  kill "$sleeper_pid" 2>/dev/null || true
+  wait "$sleeper_pid" 2>/dev/null || true
+  pass "fm_pid_runs_command matches the program being run, not a path in the arguments"
+}
+
+test_pid_home_matches_separates_state_override_domains() {
+  # Two domains can share a home root and differ only by FM_STATE_OVERRIDE, each
+  # with its own .watch.lock. They are different supervision domains and must not
+  # be able to signal each other.
+  local dir peer_pid probe
+  dir=$(make_case home-state-override)
+  mkdir -p "$dir/state-a" "$dir/state-b"
+  probe='. "$1"; if fm_pid_home_matches "$2" "$3" "$4"; then echo match; else echo nomatch; fi'
+  FM_HOME="$dir" FM_STATE_OVERRIDE="$dir/state-a" sleep 30 &
+  peer_pid=$!
+  sleep 0.2
+  if [ -r "/proc/$peer_pid/environ" ]; then
+    [ "$(bash -c "$probe" _ "$LIB" "$peer_pid" "$dir" "$dir/state-a")" = match ] \
+      || fail "a process in the same home and state dir was not attributed to it"
+    [ "$(bash -c "$probe" _ "$LIB" "$peer_pid" "$dir" "$dir/state-b")" = nomatch ] \
+      || fail "a process in a DIFFERENT state-override domain was attributed to this one (cross-domain kill)"
+  else
+    echo "skip: home attribution needs /proc (Linux)"
+  fi
+  kill "$peer_pid" 2>/dev/null || true
+  wait "$peer_pid" 2>/dev/null || true
+  pass "fm_pid_home_matches treats a different FM_STATE_OVERRIDE as a different home"
+}
+
 test_singleton_start
 test_pid_identity_is_locale_invariant
+test_lock_acquire_fails_closed_on_an_unwritable_state_dir
+test_watch_fails_loudly_when_the_state_dir_is_unwritable
+test_pid_runs_command_matches_only_the_program_being_run
+test_pid_home_matches_separates_state_override_domains
 test_lock_metadata_is_staged_before_the_lock_is_published
 test_restart_never_kills_a_sibling_homes_watcher
 test_watch_fails_loudly_when_lock_staging_fails
