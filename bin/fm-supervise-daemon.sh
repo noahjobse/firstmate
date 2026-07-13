@@ -1280,8 +1280,9 @@ fm_super_main() {
   fm_lock_try_acquire "$LOCK" stage_daemon_lock_meta
   lock_rc=$?
   if [ "$lock_rc" -eq 2 ]; then
-    # We could not build a lock at all: nobody holds it, so this is not contention
-    # and must not be reported as another daemon running.
+    # We could not build a lock at all and no live holder exists (any lock still on
+    # disk names a dead daemon), so this is not contention and must not be reported
+    # as another daemon running.
     echo "error: could not create the daemon lock $LOCK (state dir unwritable or full, or ps unavailable)" >&2
     exit 1
   fi

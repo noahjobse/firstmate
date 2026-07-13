@@ -963,13 +963,13 @@ test_lock_acquire_fails_closed_on_an_unwritable_state_dir() {
   out=$(timeout 20 env FM_STATE_OVERRIDE="$state" bash -c '
     . "$1"
     fm_lock_try_acquire "$2/.contend.lock"
-    printf "rc=%s held=%s staged_failed=%s\n" "$?" "${FM_LOCK_HELD_PID:-}" "${FM_LOCK_STAGE_FAILED:-}"
+    printf "rc=%s held=[%s] staged_failed=[%s]\n" "$?" "${FM_LOCK_HELD_PID:-}" "${FM_LOCK_STAGE_FAILED:-}"
   ' _ "$LIB" "$state" 2>&1)
   rc=$?
   chmod 700 "$state"
   [ "$rc" -eq 0 ] || fail "acquire on an unwritable state dir did not terminate cleanly (rc=$rc): $out"
   case "$out" in
-    *"rc=2 held= staged_failed=1"*) ;;
+    *"rc=2 held=[] staged_failed=[1]"*) ;;
     *) fail "unwritable state dir was not reported as an own failure: $out" ;;
   esac
   case "$out" in
@@ -1008,11 +1008,11 @@ test_unwritable_state_dir_with_a_live_holder_is_contention() {
   out=$(timeout 20 env FM_HOME="$dir" bash -c '
     . "$1"
     fm_lock_try_acquire "$2/state/.watch.lock"
-    printf "rc=%s held=%s staged_failed=%s\n" "$?" "${FM_LOCK_HELD_PID:-}" "${FM_LOCK_STAGE_FAILED:-}"
+    printf "rc=%s held=[%s] staged_failed=[%s]\n" "$?" "${FM_LOCK_HELD_PID:-}" "${FM_LOCK_STAGE_FAILED:-}"
     fm_watcher_healthy "$2/state" "$3" 300 "$2" && printf "healthy\n"
   ' _ "$LIB" "$dir" "$WATCH" 2>&1)
   case "$out" in
-    *"rc=1 held=$pid staged_failed="*) ;;
+    *"rc=1 held=[$pid] staged_failed=[]"*) ;;
     *) fail "a live holder on an unwritable state dir was not reported as contention: $out" ;;
   esac
   case "$out" in
@@ -1031,6 +1031,41 @@ test_unwritable_state_dir_with_a_live_holder_is_contention() {
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   pass "an unwritable state dir with a live holder reports contention, not 'nothing armed'"
+}
+
+test_contention_after_a_failed_steal_mutex_reports_no_own_failure() {
+  # The steal mutex is acquired through fm_lock_try_acquire itself, so an
+  # unwritable state dir sets FM_LOCK_STAGE_FAILED inside that recursion. If a live
+  # holder then claims the primary lock, the outer call returns contention - and
+  # must NOT hand the caller an own-failure flag as well: rc 1 always means someone
+  # else holds it, and only rc 2 means we could not build a lock. The probe forces
+  # the race deterministically by making the primary pid read dead once (so we
+  # descend into the steal path) and live afterwards (so a fresh holder appears).
+  local dir state out
+  [ "$(id -u)" -ne 0 ] || { echo "skip: running as root, an unwritable dir is still writable"; return 0; }
+  dir=$(make_case contention-after-failed-steal)
+  state="$dir/state"
+  mkdir -p "$state/.race.lock"
+  printf '4242\n' > "$state/.race.lock/pid"
+  touch -d '-30 seconds' "$state/.race.lock" 2>/dev/null || touch -t 200001010000 "$state/.race.lock"
+  chmod 500 "$state"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1/$2 are the probe shell's own positional args
+  out=$(timeout 20 env FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    alive_calls=0
+    fm_pid_alive() {
+      alive_calls=$((alive_calls + 1))
+      [ "$alive_calls" -gt 1 ]
+    }
+    fm_lock_try_acquire "$2/.race.lock"
+    printf "rc=%s held=[%s] staged_failed=[%s]\n" "$?" "${FM_LOCK_HELD_PID:-}" "${FM_LOCK_STAGE_FAILED:-}"
+  ' _ "$LIB" "$state" 2>&1)
+  chmod 700 "$state"
+  case "$out" in
+    *"rc=1 held=[4242] staged_failed=[]"*) ;;
+    *) fail "contention after a failed steal mutex did not report a clean contention outcome: $out" ;;
+  esac
+  pass "contention never returns with an own-failure flag left over from the steal mutex"
 }
 
 test_owner_dir_leaves_nothing_behind_when_a_stage_hook_writes_extra_files() {
@@ -1220,6 +1255,7 @@ test_pid_identity_is_locale_invariant
 test_pid_identity_is_stable_across_reads
 test_lock_acquire_fails_closed_on_an_unwritable_state_dir
 test_unwritable_state_dir_with_a_live_holder_is_contention
+test_contention_after_a_failed_steal_mutex_reports_no_own_failure
 test_owner_dir_leaves_nothing_behind_when_a_stage_hook_writes_extra_files
 test_watch_fails_loudly_when_the_state_dir_is_unwritable
 test_pid_runs_command_matches_only_the_program_being_run

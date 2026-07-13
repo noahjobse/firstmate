@@ -6,9 +6,9 @@
 # holder must never write lock metadata through the lock path afterwards. See
 # fm_lock_stage_owner_meta and docs/incidents/2026-07-12-torn-watcher-lock.md.
 # The acquire helpers distinguish three outcomes: 0 held, 1 lost to another holder
-# (FM_LOCK_HELD_PID), and 2 when this holder could not build a lock at all
-# (FM_LOCK_STAGE_FAILED) - which is our own failure, not contention, and callers
-# must fail loudly on it rather than stand down.
+# (FM_LOCK_HELD_PID), and 2 when this holder could not build a lock at all and no
+# live holder exists (FM_LOCK_STAGE_FAILED) - which is our own failure, not
+# contention, and callers must fail loudly on it rather than stand down.
 
 FM_WAKE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_WAKE_DEFAULT_ROOT="$(cd "$FM_WAKE_LIB_DIR/.." && pwd)"
@@ -494,16 +494,32 @@ fm_lock_recheck_stale_owner() {
   return 0
 }
 
+# The one gate every contention path goes through. The steal mutex is acquired
+# through this same function, so its own failures set FM_LOCK_STAGE_FAILED; a
+# contention return that carried that flag onwards would hand the caller both
+# signals at once and contradict the contract that ONLY own failures set it.
+fm_lock_contention_rc() {
+  local lockdir=$1 pid=${2:-}
+  [ -n "$pid" ] || pid=$(cat "$lockdir/pid" 2>/dev/null || true)
+  # shellcheck disable=SC2034 # Read by callers after the lock helpers return.
+  FM_LOCK_HELD_PID=$pid
+  FM_LOCK_OWNER_DIR=
+  FM_LOCK_STAGE_FAILED=
+  return 1
+}
+
 # fm_lock_try_acquire <lockdir> [<stage_fn>]
 # stage_fn, when given, stages this holder's identity metadata into the owner dir
 # before the lock is published (see fm_lock_stage_owner_meta). It is deliberately
 # NOT passed to the internal steal mutex below: that is a different lock with no
 # identity of its own.
-# Returns 0 held, 2 when this holder could not build a lock at all
-# (FM_LOCK_STAGE_FAILED is set; the lock is NOT held by anyone), 1 lost to the
-# holder in FM_LOCK_HELD_PID. Own failures return before the steal path: stealing
-# is pointless when we cannot create an owner dir, and recursing into the steal
-# mutex on a state dir we cannot write would recurse without bound.
+# Returns 0 held, 2 when this holder could not build a lock at all AND no live
+# holder exists (FM_LOCK_STAGE_FAILED is set; a lock file may still sit on disk
+# from a dead holder, but nothing is running), 1 lost to the holder in
+# FM_LOCK_HELD_PID (FM_LOCK_STAGE_FAILED cleared). Own failures return before the
+# steal path: stealing is pointless when we cannot create an owner dir, and
+# recursing into the steal mutex on a state dir we cannot write would recurse
+# without bound.
 fm_lock_try_acquire() {
   local lockdir=$1 stage_fn=${2:-} pid steal cur rc steal_owner primary_owner create_rc steal_rc
   FM_LOCK_HELD_PID=
@@ -521,12 +537,12 @@ fm_lock_try_acquire() {
 
   pid=$(cat "$lockdir/pid" 2>/dev/null || true)
   if fm_pid_alive "$pid"; then
-    FM_LOCK_HELD_PID=$pid
-    return 1
+    fm_lock_contention_rc "$lockdir" "$pid"
+    return
   fi
   if fm_lock_mid_acquire_is_fresh "$lockdir" "$pid"; then
-    FM_LOCK_HELD_PID=$pid
-    return 1
+    fm_lock_contention_rc "$lockdir" "$pid"
+    return
   fi
 
   steal="$lockdir.steal"
@@ -539,10 +555,10 @@ fm_lock_try_acquire() {
     # claimed the lock while we were here, and rc 2 promises nothing is running.
     cur=$(cat "$lockdir/pid" 2>/dev/null || true)
     if fm_pid_alive "$cur"; then
-      FM_LOCK_HELD_PID=$cur
-      FM_LOCK_OWNER_DIR=
-      return 1
+      fm_lock_contention_rc "$lockdir" "$cur"
+      return
     fi
+    # shellcheck disable=SC2034 # Read by callers after fm_lock_try_acquire returns.
     FM_LOCK_HELD_PID=
     FM_LOCK_OWNER_DIR=
     # shellcheck disable=SC2034 # Read by callers after fm_lock_try_acquire returns.
@@ -550,30 +566,26 @@ fm_lock_try_acquire() {
     return 2
   fi
   if [ "$steal_rc" -ne 0 ]; then
-    FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
-    FM_LOCK_OWNER_DIR=
-    return 1
+    fm_lock_contention_rc "$lockdir"
+    return
   fi
   steal_owner=${FM_LOCK_OWNER_DIR:-}
 
   cur=$(cat "$lockdir/pid" 2>/dev/null || true)
   if fm_pid_alive "$cur"; then
     fm_lock_release "$steal"
-    FM_LOCK_HELD_PID=$cur
-    FM_LOCK_OWNER_DIR=
-    return 1
+    fm_lock_contention_rc "$lockdir" "$cur"
+    return
   fi
   if fm_lock_mid_acquire_is_fresh "$lockdir" "$cur"; then
     fm_lock_release "$steal"
-    FM_LOCK_HELD_PID=$cur
-    FM_LOCK_OWNER_DIR=
-    return 1
+    fm_lock_contention_rc "$lockdir" "$cur"
+    return
   fi
   if ! fm_lock_points_to_owner "$steal" "$steal_owner"; then
     fm_lock_release "$steal"
-    FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
-    FM_LOCK_OWNER_DIR=
-    return 1
+    fm_lock_contention_rc "$lockdir"
+    return
   fi
 
   primary_owner=
@@ -583,9 +595,8 @@ fm_lock_try_acquire() {
   cur=$(cat "$lockdir/pid" 2>/dev/null || true)
   if ! fm_lock_recheck_stale_owner "$lockdir" "$primary_owner" "$cur"; then
     fm_lock_release "$steal"
-    FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
-    FM_LOCK_OWNER_DIR=
-    return 1
+    fm_lock_contention_rc "$lockdir"
+    return
   fi
 
   fm_lock_remove_path "$lockdir" || true
@@ -597,16 +608,17 @@ fm_lock_try_acquire() {
     return 2
   fi
   if [ "$rc" -ne 0 ]; then
-    # shellcheck disable=SC2034 # Read by callers after fm_lock_try_acquire returns.
-    FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
-    FM_LOCK_OWNER_DIR=
+    fm_lock_release "$steal"
+    fm_lock_contention_rc "$lockdir"
+    return
   fi
   fm_lock_release "$steal"
   return "$rc"
 }
 
 # Waits out contention (rc 1: another holder, which always ends), but never an own
-# failure (rc 2: we cannot build a lock at all). That condition is permanent, so
+# failure (rc 2: we cannot build a lock at all and no live holder exists, so no
+# holder is coming to release anything). That condition is permanent, so
 # retrying it would spin forever - and a caller blocked here queues nothing and
 # surfaces nothing, which is a silent total supervision failure. Returns 2, with
 # FM_LOCK_STAGE_FAILED set, so the caller can fail loudly instead.

@@ -44,8 +44,9 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 if ! fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"; then
-  # Not contention (which resolves): we cannot build a lock at all, so the queue
-  # cannot be drained safely. Say so rather than blocking or draining unlocked.
+  # Not contention (which resolves): we cannot build a lock at all and no live
+  # holder exists, so the queue cannot be drained safely. Say so rather than
+  # blocking or draining unlocked.
   echo "fm-wake-drain: FAILED - could not lock the wake queue in $STATE (state dir unwritable or full); the queue was NOT drained" >&2
   exit 1
 fi
