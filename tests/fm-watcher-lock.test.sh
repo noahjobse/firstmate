@@ -787,6 +787,7 @@ test_watch_lock_names_its_own_watcher_from_a_clean_environment() {
   state="$dir/state"
   fakebin="$dir/fakebin"
   out="$dir/watch.out"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1/$2 are the probe shell's own positional args
   probe='. "$1"; if fm_watcher_healthy "$2/state" "$3" 300 "$2"; then echo healthy; else echo unhealthy; fi'
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
@@ -958,6 +959,7 @@ test_lock_acquire_fails_closed_on_an_unwritable_state_dir() {
   dir=$(make_case lock-unwritable-state)
   state="$dir/state"
   chmod 500 "$state"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1/$2 are the probe shell's own positional args
   out=$(timeout 20 env FM_STATE_OVERRIDE="$state" bash -c '
     . "$1"
     fm_lock_try_acquire "$2/.contend.lock"
@@ -1004,6 +1006,7 @@ test_pid_runs_command_matches_only_the_program_being_run() {
   # tail or editor on bin/fm-watch.sh must never be mistaken for the watcher.
   local dir tail_pid sleeper_pid probe
   dir=$(make_case pid-runs-command)
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1/$2 are the probe shell's own positional args
   probe='. "$1"; if fm_pid_runs_command "$2" "$3"; then echo match; else echo nomatch; fi'
   tail -f "$WATCH" > /dev/null 2>&1 &
   tail_pid=$!
@@ -1037,6 +1040,7 @@ test_pid_runs_command_matches_a_program_path_containing_spaces() {
 sleep 30
 SH
   chmod +x "$watcher"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1/$2 are the probe shell's own positional args
   probe='. "$1"; if fm_pid_runs_command "$2" "$3"; then echo match; else echo nomatch; fi'
   "$watcher" &
   live_pid=$!
@@ -1065,6 +1069,7 @@ test_wake_append_fails_fast_when_the_state_dir_is_unwritable() {
   dir=$(make_case wake-append-unwritable-state)
   state="$dir/state"
   chmod 500 "$state"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1 is the probe shell's own positional arg
   out=$(timeout 15 env FM_STATE_OVERRIDE="$state" bash -c '
     . "$1"
     fm_wake_append signal fm-x "signal: fm-x"
@@ -1111,6 +1116,7 @@ test_pid_home_matches_separates_state_override_domains() {
   local dir peer_pid probe
   dir=$(make_case home-state-override)
   mkdir -p "$dir/state-a" "$dir/state-b"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1/$2 are the probe shell's own positional args
   probe='. "$1"; if fm_pid_home_matches "$2" "$3" "$4"; then echo match; else echo nomatch; fi'
   FM_HOME="$dir" FM_STATE_OVERRIDE="$dir/state-a" sleep 30 &
   peer_pid=$!

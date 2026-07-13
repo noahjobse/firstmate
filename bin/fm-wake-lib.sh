@@ -501,6 +501,7 @@ fm_lock_try_acquire() {
   if [ "$steal_rc" -eq 2 ]; then
     FM_LOCK_HELD_PID=
     FM_LOCK_OWNER_DIR=
+    # shellcheck disable=SC2034 # Read by callers after fm_lock_try_acquire returns.
     FM_LOCK_STAGE_FAILED=1
     return 2
   fi
