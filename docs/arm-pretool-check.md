@@ -118,6 +118,8 @@ Path-qualified `pkill`, `command pkill`, and `sudo pkill` are recognized.
 
 `kill "$(pgrep -f '/bin/fm-watch.sh')"` is also denied because the executed `kill` consumes an executed watcher-wide `pgrep` substitution.
 A standalone read-only `pgrep` is allowed.
+Allowed is not endorsed: `AGENTS.md` section 8 forbids identifying or counting watchers with a `-f` command-line match, because a crewmate whose brief quotes the watcher path matches as a watcher (`docs/incidents/2026-07-12-torn-watcher-lock.md`).
+The hook lets a read-only `pgrep` through only because it kills nothing; watcher liveness is read from the lock pid plus `ps -o comm=`.
 Quoted text such as `echo 'pkill -f fm-watch'` is data and is allowed.
 
 Unsupported compound grammar - a loop, `case`, `if`, or other construct the classifier does not model - is failed closed for broad kills the same way it is for protected executions.

@@ -39,6 +39,17 @@
 # Supported backends: herdr, tmux. Others (zellij, orca, cmux) have no verified
 # non-visible-launch primitive here yet and refuse loudly.
 #
+# Every subcommand reads the daemon lock through the THREE-state
+# daemon_lock_state_resolved, never a boolean: a live holder that is positively
+# attributed to this home (it runs this home's daemon script and its own
+# environment resolves to this home and state dir) is the running daemon even when
+# its recorded identity predates the identity-format change, while a live holder
+# that can be neither identified nor attributed is never evicted, never signalled,
+# and never started beside. That refusal exits NON-ZERO and names the lock and the
+# remedy - fail closed must not mean fail silent (AGENTS.md section 8;
+# docs/incidents/2026-07-12-torn-watcher-lock.md). A refused `stop` therefore
+# leaves state/.afk in place, because away mode was not exited.
+#
 # Test seam: FM_AFK_LAUNCH_ENTRY overrides the command run in the created
 # terminal (default bin/fm-afk-start.sh), so a topology test can run a harmless
 # placeholder instead of a real daemon. FM_SUPERVISOR_TARGET/FM_SUPERVISOR_BACKEND
