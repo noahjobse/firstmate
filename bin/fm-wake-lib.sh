@@ -53,13 +53,19 @@ fm_pid_identity() {
   cmd=$(LC_ALL=C ps -p "$pid" -o command= 2>/dev/null) || return 1
   [ -n "$cmd" ] || return 1
   # The start half must be byte-stable across reads, or a live watcher's own lock
-  # reads as a reused pid and supervision reports itself down. lstart was measured
-  # stable for a fixed pid on this host (docs/incidents/2026-07-12-torn-watcher-lock.md)
-  # and did NOT cause that incident, but it is derived from a boot-time estimate
-  # recomputed on every ps invocation, so a host that recomputes btime across a
-  # suspend or a clock resync could still shift it. Defense in depth: prefer the
-  # kernel's boot-relative start ticks wherever /proc exists, which no clock
-  # adjustment can perturb, and keep lstart only as the fallback for hosts without it.
+  # reads as a reused pid and supervision reports itself down. `ps -o lstart=` is
+  # NOT byte-stable: it is DERIVED, from the kernel's btime plus the process's
+  # starttime ticks. starttime never moves, but btime is recomputed and jitters by
+  # ~1s (measured on this WSL2 host, roughly every 30s), and every jump shifts the
+  # derived lstart of every live process - so an lstart fingerprint goes stale
+  # against its OWN process, with no second writer, and reports a live watcher as a
+  # reused pid. That drift is the primary cause of the false alarms and the
+  # lock-yank outage in docs/incidents/2026-07-12-torn-watcher-lock.md.
+  # /proc/<pid>/stat field 22 is boot-relative and immune, so it is the fix, not an
+  # optimisation: do not "simplify" this back to lstart.
+  # lstart survives only as the fallback where /proc does not exist, and it is an
+  # ACTIVELY DRIFTING primitive there, not an equivalent one. On a host with no
+  # /proc AND a jittering btime, this class of false alarm is NOT fixed.
   start=$(fm_pid_start_ticks "$pid") \
     || start=$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null) \
     || return 1

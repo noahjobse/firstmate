@@ -72,12 +72,18 @@ CONFIRM_TIMEOUT=${FM_ARM_CONFIRM_TIMEOUT:-10}
 # Poll interval while attached to an existing healthy watcher.
 ATTACH_POLL=${FM_ARM_ATTACH_POLL:-0.5}
 
+# Removes only a lock this home itself recorded. The home compare is canonicalised
+# on both sides, exactly as fm_watcher_lock_matches_pid canonicalises the check
+# this backstops: FM_HOME arrives spelled however the environment spells it (a
+# trailing slash, a path through a symlink), and a raw compare would fail a home
+# against its OWN stale lock and leave it behind. Canonicalising only makes the
+# match more accurate; it never widens what may be removed.
 clear_stale_recorded_watcher_lock() {
   local lock_home lock_path lock_identity
   lock_home=$(cat "$WATCH_LOCK/fm-home" 2>/dev/null || true)
   lock_path=$(cat "$WATCH_LOCK/watcher-path" 2>/dev/null || true)
   lock_identity=$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)
-  [ "$lock_home" = "$FM_HOME" ] || return 0
+  [ "$(fm_path_canonical "$lock_home")" = "$(fm_path_canonical "$FM_HOME")" ] || return 0
   [ "$lock_path" = "$WATCH" ] || return 0
   [ -n "$lock_identity" ] || return 0
   fm_lock_remove_path "$WATCH_LOCK" || true

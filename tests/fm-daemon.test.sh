@@ -87,7 +87,9 @@ test_afk_start_treats_an_unreadable_daemon_identity_as_held() {
   # A daemon that started BEFORE an in-place update fingerprinted itself in the
   # old identity format (ps lstart, before the /proc start-ticks fingerprint).
   # Reading that as "dead" would evict a LIVE daemon's lock and exec a second
-  # daemon beside it. Ambiguity means held.
+  # daemon beside it. Ambiguity means held - but standing down must be LOUD and
+  # non-zero, naming the lock to remove, or the launcher waits for a daemon that is
+  # never coming and away mode wedges with no explanation.
   local dir state out status lock
   [ -r "/proc/$$/stat" ] || {
     echo "skip: the legacy-identity transition needs the /proc start-ticks format (Linux)"
@@ -103,11 +105,12 @@ test_afk_start_treats_an_unreadable_daemon_identity_as_held() {
   out=$(FM_STATE_OVERRIDE="$state" FM_SUPERVISOR_BACKEND=unsupported "$AFK_START" 2>&1)
   status=$?
 
-  [ "$status" -eq 0 ] || fail "fm-afk-start.sh should stand down on an unreadable identity, not fail: $out"
-  assert_contains "$out" "not starting a second daemon" "fm-afk-start.sh did not report the unreadable live holder"
+  [ "$status" -ne 0 ] || fail "fm-afk-start.sh stood down SILENTLY (exit 0) on an unreadable identity: $out"
+  assert_contains "$out" "$lock" "fm-afk-start.sh did not name the exact lock to remove"
+  assert_contains "$out" "refusing to start a second daemon" "fm-afk-start.sh did not report the unreadable live holder"
   assert_not_contains "$out" "starting supervise daemon" "fm-afk-start.sh started a SECOND daemon beside a live one it could not identify"
   assert_present "$lock/pid" "fm-afk-start.sh evicted the lock of a live daemon it could not identify"
-  pass "fm-afk-start.sh treats a live holder with an unreadable identity as still holding the lock"
+  pass "fm-afk-start.sh treats a live holder with an unreadable identity as held, and refuses loudly"
 }
 
 test_daemon_state_root_uses_fm_home() {

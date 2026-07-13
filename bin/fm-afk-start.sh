@@ -7,6 +7,9 @@
 #   state/.supervise-daemon.lock, and:
 #     - prints "afk: daemon already running pid=<pid>" then exits 0 when that
 #       lock is held by a live daemon (a REFRESH: no stale-artifact clear);
+#     - exits NON-ZERO, naming the lock to remove, when the lock is held by a live
+#       pid whose recorded identity this version cannot read: never evict it,
+#       never start a second daemon beside it, and never stand down silently;
 #     - otherwise clears any prior away session's stale escalation artifacts
 #       (fm_afk_clear_stale_artifacts) for a direct, non-prepared start, then
 #       execs bin/fm-supervise-daemon.sh in the foreground. A prepared start was
@@ -43,7 +46,7 @@ FM_AFK_DAEMON="$FM_AFK_START_DIR/fm-supervise-daemon.sh"
 . "$FM_AFK_START_DIR/fm-wake-lib.sh"
 
 fm_afk_start_usage() {
-  sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # fm_afk_clear_stale_artifacts: on a FRESH away-session entry (the daemon is not
@@ -108,9 +111,10 @@ daemon_lock_pid() {
 # The lock's three states, mirroring daemon_pid_matches: 0 held by a live,
 # positively identified daemon; 1 no live holder (no lock, a dead pid, or a live
 # pid that is provably not the daemon); 2 a LIVE holder this code cannot identify.
-# Every caller reads it as a plain predicate, so only 0 is truthy: nothing signals
-# or trusts a holder it cannot identify. A caller that would EVICT the lock must
-# additionally treat 2 as held (see fm_afk_start_main).
+# Every caller must read all three - a boolean view of this collapses 2 into "no
+# daemon running" and reintroduces the eviction that state exists to prevent.
+# 2 is never reclaimed, never signalled, and never started beside; it is reported
+# loudly instead (fm_afk_ambiguous_lock_message).
 daemon_lock_state() {
   local owner pid rc=0
   owner=$(daemon_lock_owner) || return 1
@@ -120,8 +124,14 @@ daemon_lock_state() {
   return "$rc"
 }
 
-daemon_lock_held_by_live_daemon() {
-  daemon_lock_state
+# Fail-closed must not mean fail-silent: refusing to act on an ambiguous lock is
+# right, but the refusal has to name the exact lock and the exact remedy, or away
+# mode wedges behind a stale lock with nothing telling the captain why.
+fm_afk_ambiguous_lock_message() {  # <refused-action>
+  local pid
+  pid=$(daemon_lock_pid 2>/dev/null || true)
+  printf 'away-mode daemon lock %s is held by live pid=%s whose identity this version cannot read; refusing to %s. If pid %s is not the away-mode daemon, remove %s and retry.\n' \
+    "$FM_AFK_LOCK" "${pid:-unknown}" "$1" "${pid:-unknown}" "$FM_AFK_LOCK"
 }
 
 fm_afk_start_main() {
@@ -150,10 +160,12 @@ fm_afk_start_main() {
   # duplicate escalations into the captain's session - and "an ambiguous identity
   # means the holder is gone" is the very assumption that killed a live watcher in
   # docs/incidents/2026-07-12-torn-watcher-lock.md. Only a holder we can prove is
-  # not the daemon (lock_state 1) is ever reclaimed.
+  # not the daemon (lock_state 1) is ever reclaimed. Standing down here must still
+  # be LOUD and non-zero: a silent zero would leave bin/fm-afk-launch.sh waiting for
+  # a daemon that is never coming, and away mode would wedge with no explanation.
   if [ "$lock_state" -eq 2 ]; then
-    echo "afk: daemon lock held by live pid=$pid whose identity this version cannot read; not starting a second daemon"
-    return 0
+    echo "afk: $(fm_afk_ambiguous_lock_message 'start a second daemon')" >&2
+    return 1
   fi
 
   if fm_pid_alive "$pid" && [ -n "$pid" ]; then

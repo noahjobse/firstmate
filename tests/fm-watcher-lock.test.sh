@@ -429,6 +429,44 @@ test_watch_restart_rejects_reused_pid() {
   pass "watch restart refuses to signal a reused pid"
 }
 
+test_watch_restart_clears_a_stale_lock_for_a_differently_spelled_home() {
+  # The same stale reused-pid lock as above, but with FM_HOME spelled with a trailing
+  # slash. The lock is genuinely this home's and genuinely stale, and only
+  # clear_stale_recorded_watcher_lock can free it - the live reused pid stops the
+  # fresh watcher from stealing it. A raw string compare of the recorded fm-home
+  # against FM_HOME fails on the spelling, leaves the stale lock in place, and the
+  # home cannot re-arm at all.
+  local dir state fakebin out live pid i lock_pid
+  dir=$(make_case restart-home-spelling)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/restart.out"
+  sleep 300 &
+  live=$!
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$live" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "stale watcher identity" > "$state/.watch.lock/pid-identity"
+  PATH="$fakebin:$PATH" FM_HOME="$dir/" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" --restart > "$out" &
+  pid=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    grep -qF 'watcher: started pid=' "$out" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  { [ -n "$lock_pid" ] && [ "$lock_pid" != "$live" ] && kill -0 "$lock_pid" 2>/dev/null; } \
+    || fail "restart did not clear this home's stale lock when FM_HOME carried a trailing slash (got '$lock_pid')"
+  is_live_non_zombie "$live" || fail "restart killed a reused unrelated pid"
+  kill "$pid" "$lock_pid" "$live" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  pass "watch restart clears its own stale lock for a home spelled with a trailing slash"
+}
+
 test_watch_restart_reports_healthy_peer_without_attaching() {
   local dir state fakebin out peer identity armpid status
   dir=$(make_case restart-healthy-peer)
@@ -719,10 +757,10 @@ test_pid_identity_is_stable_across_reads() {
   # The identity is a fingerprint of ONE live process instance, so the same live pid
   # must fingerprint byte-identically every time or the lock's own holder eventually
   # reads as a reused pid and supervision reports itself down while a watcher is
-  # running. ps's lstart was measured stable for a fixed pid on the incident host, but
-  # it is recomputed from a boot-time estimate on every invocation, so a suspend or a
-  # clock resync could shift it; the identity is therefore derived from the kernel's
-  # own start ticks wherever they are readable, and this asserts that stability.
+  # running. ps's lstart is NOT stable: it is derived from a btime that jitters, so it
+  # drifts against its own process (docs/incidents/2026-07-12-torn-watcher-lock.md).
+  # The identity is derived from the kernel's own start ticks wherever they are
+  # readable, and this asserts that stability.
   local live baseline current i
   sleep 300 &
   live=$!
@@ -739,6 +777,49 @@ test_pid_identity_is_stable_across_reads() {
   kill "$live" 2>/dev/null || true
   wait "$live" 2>/dev/null || true
   pass "fm_pid_identity is byte-stable across repeated reads of one live pid"
+}
+
+test_pid_identity_is_derived_from_start_ticks_not_lstart() {
+  # The discriminator behind the incident, asserted directly rather than by the
+  # property it happens to satisfy. `ps -o lstart=` is DERIVED - btime (which is
+  # recomputed and jitters by ~1s on this host, roughly every 30s) plus the process's
+  # own starttime ticks - so every btime jump shifts the derived lstart of EVERY live
+  # process and an lstart fingerprint goes stale against its own process with no
+  # second writer. /proc/<pid>/stat field 22 is boot-relative and carries no btime
+  # term at all, so it cannot move. This pins the fingerprint to field 22 and shows an
+  # lstart-derived one WOULD move across a btime shift, so a future refactor cannot
+  # quietly regress the cure back to lstart. btime cannot be injected, so the shift is
+  # applied to the derivation itself, which is exactly where the drift enters.
+  local live ticks identity head lstart hz derived derived_after_btime_shift
+  if [ ! -r "/proc/$$/stat" ]; then
+    echo "skip: the start-ticks fingerprint needs /proc (Linux)"
+    return 0
+  fi
+  sleep 300 &
+  live=$!
+  ticks=$(bash -c '. "$1"; fm_pid_start_ticks "$2"' _ "$LIB" "$live" 2>/dev/null)
+  identity=$(bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live" 2>/dev/null)
+  head=${identity%%[[:space:]]*}
+  lstart=$(LC_ALL=C ps -p "$live" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  [ -n "$ticks" ] || fail "no start ticks readable for a live pid"
+  [ "$head" = "$ticks" ] \
+    || fail "fm_pid_identity's start half is not /proc/<pid>/stat field 22 (got '$head', want '$ticks')"
+  case "$identity" in
+    "$lstart"*) fail "fm_pid_identity is still lstart-derived, the primitive that drifts" ;;
+  esac
+  # What an lstart-derived fingerprint IS: btime + starttime/HZ. Move btime by the
+  # observed 1s of jitter and it moves with it, while the shipped fingerprint - which
+  # never reads btime - cannot.
+  hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+  derived=$(( $(awk '/^btime /{print $2}' /proc/stat) + ticks / hz ))
+  derived_after_btime_shift=$(( $(awk '/^btime /{print $2}' /proc/stat) + 1 + ticks / hz ))
+  [ "$derived" != "$derived_after_btime_shift" ] \
+    || fail "the lstart derivation did not move across a btime shift; the test cannot discriminate"
+  [ "$(bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live" 2>/dev/null)" = "$identity" ] \
+    || fail "the start-ticks fingerprint moved for a fixed live pid"
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  pass "fm_pid_identity fingerprints from /proc start ticks, immune to the btime shift that moves lstart"
 }
 
 test_lock_metadata_is_staged_before_the_lock_is_published() {
@@ -1318,6 +1399,7 @@ test_pid_home_matches_is_path_representation_independent() {
 test_singleton_start
 test_pid_identity_is_locale_invariant
 test_pid_identity_is_stable_across_reads
+test_pid_identity_is_derived_from_start_ticks_not_lstart
 test_pid_home_matches_is_path_representation_independent
 test_lock_acquire_fails_closed_on_an_unwritable_state_dir
 test_unwritable_state_dir_with_a_live_holder_is_contention
@@ -1347,6 +1429,7 @@ test_lock_empty_pid_uses_minimum_grace
 test_lock_late_claim_loses_after_recreate
 test_lock_paused_mid_acquire_claim_fails_during_steal
 test_watch_restart_rejects_reused_pid
+test_watch_restart_clears_a_stale_lock_for_a_differently_spelled_home
 test_watch_restart_reports_healthy_peer_without_attaching
 test_watcher_self_evicts_on_lock_takeover
 test_arm_attaches_and_waits_for_live_fresh_watcher

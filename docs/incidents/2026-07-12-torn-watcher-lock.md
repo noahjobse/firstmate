@@ -18,7 +18,19 @@ Two failure modes, reported as if they were separate bugs.
 
 ## Root cause
 
-One cause, both modes: **the watcher lock's identity metadata was published non-atomically, and was written through the lock path after the claim.**
+Two causes, and the first one alone is sufficient for both modes.
+
+**Primary: the pid fingerprint drifted against its own process.**
+`fm_pid_identity` fingerprinted a pid with `ps -o lstart=`, which is not a stable value.
+`lstart` is DERIVED: the kernel's `btime` (boot epoch, from `/proc/stat`) plus the process's own `starttime` ticks.
+`starttime` never moves, but `btime` is recomputed and jitters by about a second on this WSL2 host, roughly every 30 seconds.
+Every jump shifts the derived `lstart` of every live process at once.
+So a stored `lstart` fingerprint goes stale against the very process it fingerprints, with no second writer and no lock race at all: within about 30 seconds a live watcher's own lock reads as a reused pid.
+That alone produces mode 1 (the false-positive banner and `watcher: FAILED`) and then mode 2, because `--restart` reads the mismatch as a recycled pid and yanks the lock out from under a live watcher.
+This was suspected first, tested over too short a window, wrongly recorded here as refuted, and re-measured and CONFIRMED on 2026-07-13 (see Evidence).
+
+**Co-cause: the lock's identity metadata was published non-atomically, and was written through the lock path after the claim.**
+This is the genuine two-writer tear, and it is real and separately reproducible; it is not what the drifting fingerprint explains.
 
 `bin/fm-watch.sh` claimed the singleton lock with `fm_lock_try_acquire` (which publishes `pid` inside the owner dir the lock symlink names) and only afterwards wrote `fm-home`, `watcher-path`, and `pid-identity` through `$WATCH_LOCK/...`:
 
@@ -44,20 +56,37 @@ The guard was not merely crying wolf: **the restart it demanded was the thing ta
 
 ## Evidence
 
-`ps -o lstart=` was first suspected of drifting. It does not; it is stable for a fixed pid:
+### `lstart` drift: suspected, under-tested, then confirmed
+
+`ps -o lstart=` was suspected of drifting on 2026-07-12 and recorded here as refuted, on 12 samples over about 24 seconds in which `btime` never moved:
 
 ```
-$ P=$(cat /home/noah/projects/firstmate/state/.watch.lock/pid); bash lstart-drift.sh "$P"
-lock pid=252311
-pid=252311
-btime (kernel boot epoch, from /proc/stat): 1783890250
-starttime ticks (/proc/252311/stat field 22): 929381
-
  1  now=17:40:55  ps_lstart=[Sun Jul 12 17:39:03 2026]  btime=1783890250
- 2  now=17:40:57  ps_lstart=[Sun Jul 12 17:39:03 2026]  btime=1783890250
 ...
 12  now=17:41:18  ps_lstart=[Sun Jul 12 17:39:03 2026]  btime=1783890250
 ```
+
+That was an underpowered test, not a refutation.
+`btime` jumps roughly every 30 seconds on this host, so a 24-second window can easily contain zero jumps.
+
+Re-measured on 2026-07-13 against one fixed, never-restarting pid, 90 reads over 90 seconds, `btime` moved three times and `ps lstart` moved in lockstep with it:
+
+```
+btime  1783964089 -> 1783964090 -> 1783964091 -> 1783964092
+ps lstart  13:08:05 -> 13:08:06 -> 13:08:07 -> 13:08:08
+```
+
+The discriminator, across a single `btime` jump (`1783964093 -> 1783964094`) on that same never-restarting pid: `ps lstart` MOVED while the shipped `/proc` start-ticks fingerprint was UNCHANGED.
+
+```
+ps lstart        13:10:10  ->  13:10:11        (moved)
+fm_pid_identity  571766 sleep 200  ->  571766 sleep 200   (unchanged)
+```
+
+`starttime` (`/proc/<pid>/stat` field 22) is boot-relative, so no `btime` recomputation can perturb it.
+An `lstart` fingerprint invalidates itself; a start-ticks fingerprint does not.
+
+### The two-writer tear
 
 A read-only probe registered as an extra Stop hook, evaluating the primary's live lock at the instant a turn ended, caught the torn lock directly.
 The recorded identity and the live `ps` identity for the *same* lock pid disagree by 11 seconds, so they are two different processes:
@@ -101,14 +130,15 @@ Step 1 shows the incomplete lock (live `pid`, empty `pid-identity`); step 3 show
 
 ## Fix
 
-- `bin/fm-wake-lib.sh`: `fm_lock_try_create`/`fm_lock_try_acquire` take an optional stage function (`fm_lock_stage_owner_meta`) that writes a holder's identity into the owner dir **before** the symlink publishes the lock. A lock is therefore never observable half-written, and a holder never writes lock metadata through the lock path, so a late write can no longer land in a stranger's owner dir. Any failure to build a lock of our own - a failed stage hook, but equally an unwritable or full state dir that defeats `mktemp` in `fm_lock_owner_dir` or the pid write in `fm_lock_prepare_owner` - is reported as its own outcome (return `2`, `FM_LOCK_STAGE_FAILED`), never as contention: nobody holds the lock, so a caller must fail loudly instead of standing down. Returning that outcome before the steal path also bounds the recursion: `fm_lock_try_acquire` used to fall through to stealing on a state dir it could not write, and the steal mutex lives in that same dir, so it recursed into itself without bound. `fm_lock_claim` no longer rewrites a pid its own owner dir already carries, so no reader can catch a published lock inside a truncate window. Adds `fm_pid_runs_command` (anchored to the program being run, so a process that merely names the watcher path in its arguments is never mistaken for it), `fm_pid_env_value`, `fm_pid_home_readable`, and `fm_pid_home_matches` (which compares the target's resolved `STATE` as well as its home, so two domains separated only by `FM_STATE_OVERRIDE` cannot signal each other).
+- `bin/fm-wake-lib.sh`, **the primary fix**: the pid fingerprint's start half changes from `ps -o lstart=` to the kernel's boot-relative start ticks (`/proc/<pid>/stat` field 22). This is what stops a live watcher's own lock from reading as a reused pid, so it is the cure for both failure modes, not an optimisation and not defense in depth. Do not remove it, and do not "simplify" the fingerprint back to `lstart`. Where `/proc` does not exist, `lstart` remains as the fallback, and it remains an ACTIVELY DRIFTING primitive there, not an equivalent one: on a host with no `/proc` and a jittering `btime`, this class of false alarm is NOT fixed. Accepted transition: because the format changes, every lock written by a pre-update firstmate is unreadable to the new code, so a still-running pre-update watcher reads as unidentifiable until one `bin/fm-watch-arm.sh --restart` cycle replaces it. On Linux that self-heals through the attributed restart below; the captain has accepted this one-time bark.
+- `bin/fm-wake-lib.sh`, **the co-fix** for the genuine two-writer tear: `fm_lock_try_create`/`fm_lock_try_acquire` take an optional stage function (`fm_lock_stage_owner_meta`) that writes a holder's identity into the owner dir **before** the symlink publishes the lock. A lock is therefore never observable half-written, and a holder never writes lock metadata through the lock path, so a late write can no longer land in a stranger's owner dir. Any failure to build a lock of our own - a failed stage hook, but equally an unwritable or full state dir that defeats `mktemp` in `fm_lock_owner_dir` or the pid write in `fm_lock_prepare_owner` - is reported as its own outcome (return `2`, `FM_LOCK_STAGE_FAILED`), never as contention: nobody holds the lock, so a caller must fail loudly instead of standing down. Returning that outcome before the steal path also bounds the recursion: `fm_lock_try_acquire` used to fall through to stealing on a state dir it could not write, and the steal mutex lives in that same dir, so it recursed into itself without bound. `fm_lock_claim` no longer rewrites a pid its own owner dir already carries, so no reader can catch a published lock inside a truncate window. Adds `fm_pid_runs_command` (anchored to the program being run, so a process that merely names the watcher path in its arguments is never mistaken for it), `fm_pid_env_value`, `fm_pid_home_readable`, and `fm_pid_home_matches` (which compares the target's resolved `STATE` as well as its home, so two domains separated only by `FM_STATE_OVERRIDE` cannot signal each other).
 - `bin/fm-watch.sh`: stages `fm-home`, `watcher-path`, and `pid-identity` at claim time; the post-claim writes through `$WATCH_LOCK` are gone. Failing to create the lock exits non-zero with `watcher: FAILED`, for every cause, and `watcher: already running` is printed only when a lock actually exists.
 - `bin/fm-supervise-daemon.sh`: the daemon's singleton lock had the same post-claim write and now stages its identity the same way, and reports its own failure to create the lock as an error rather than as another daemon already running.
 - `bin/fm-watch-arm.sh`: `--restart` stops a live holder that is demonstrably running this watcher script (`fm_pid_runs_command`) **and** is positively attributed to this home (`fm_pid_home_matches`, read from the target's own environment), even when the lock's identity does not vouch for it. The attribution is not optional: `bin/fm-watch.sh` is the same script in every home, secondmates included, so a stale pid this home recorded and the OS since recycled onto a sibling home's watcher would match on command path alone and restart would kill that home's supervision - the hazard `AGENTS.md` names as `pkill -f bin/fm-watch.sh`. A live watcher whose home cannot be read (no `/proc`) is neither signalled nor has its lock cleared; it is surfaced through the honest `FAILED` report. Clearing the lock is reserved for a holder that really is not our watcher (a genuinely reused pid, or a watcher belonging to another home). This also self-heals a torn lock written by a pre-fix firstmate.
 
-- `bin/fm-wake-lib.sh`, separately from the root cause: the pid fingerprint's start half changes format from `ps -o lstart=` to the kernel's boot-relative start ticks (`/proc/<pid>/stat` field 22), with `lstart` kept as the fallback where `/proc` is absent. This is **defense in depth for the identity primitive, not the fix for this incident** - as the Evidence section records, `lstart` was tested here and proved stable for a fixed pid, and the tear came from two writers, not from a drifting fingerprint. Start ticks are kernel-authoritative and cannot be perturbed by a boot-time recomputation across a suspend or a clock resync, so the fingerprint has one fewer way to invalidate itself. Accepted transition: because the format changes, every watcher lock written by a pre-update firstmate mismatches after an in-place update, so a still-running pre-update watcher reads as "no live watcher" until one `bin/fm-watch-arm.sh --restart` cycle replaces it. On Linux that self-heals through the attributed restart above; the captain has accepted this one-time bark.
-
-- `bin/fm-wake-lib.sh`, `bin/fm-afk-start.sh`, `bin/fm-afk-launch.sh`: every consumer of that fingerprint now fails closed on ambiguity through `fm_pid_matches_identity`, which separates "this pid is provably NOT the holder" (return `1`, reclaimable) from "this holder cannot be identified at all" (return `2`: a live pid whose recorded identity is in the format the previous version wrote, or a `ps` that cannot fingerprint it). Treating an ambiguous identity as a dead holder is exactly the assumption that evicted a live watcher here, so a caller that would EVICT a lock or start a second supervisor treats `2` as still held, and a caller that would SIGNAL the pid treats `2` as not ours. Without that split, the away-mode daemon's singleton lock inherits the accepted watcher bark as something far worse: a daemon started before an in-place update would read as dead, `bin/fm-afk-start.sh` would remove its lock, and the following `exec` would run a SECOND daemon beside the live one, injecting every escalation twice.
+- `bin/fm-wake-lib.sh`, `bin/fm-afk-start.sh`, `bin/fm-afk-launch.sh`: every consumer of that fingerprint now fails closed on ambiguity through `fm_pid_matches_identity`, which separates "this pid is provably NOT the holder" (return `1`, reclaimable) from "this holder cannot be identified at all" (return `2`: a live pid whose recorded identity is in the format the previous version wrote, or a `ps` that cannot fingerprint it). Treating an ambiguous identity as a dead holder is exactly the assumption that evicted a live watcher here, so a caller that would EVICT a lock or start a second supervisor treats `2` as still held, and a caller that would SIGNAL the pid treats `2` as not ours unless it can attribute the process independently. Without that split, the away-mode daemon's singleton lock inherits the accepted watcher bark as something far worse: a daemon started before an in-place update would read as dead, `bin/fm-afk-start.sh` would remove its lock, and the following `exec` would run a SECOND daemon beside the live one, injecting every escalation twice.
+- `bin/fm-afk-launch.sh`: the launcher reads all three states too, on both the daemon lock and its own launcher lock. Routing a three-state result through a boolean made `2` falsy, so the two halves of `/afk` disagreed about the same lock: `start` closed the recorded terminal and spawned a new daemon that immediately stood down, then waited for it forever, and `stop` left a live holder unsignalled so its cleanup trap never flushed buffered escalations while `state/.afk` was still present. `stop` now signals an unidentifiable holder when, and only when, that pid is independently attributed to this home (it is executing this home's daemon script and its own environment resolves to this home and state dir), which is the same bar `bin/fm-watch-arm.sh` requires before it signals a watcher.
+- **Fail-closed must not mean fail-silent** (now a standing rule in `AGENTS.md` section 8). Refusing to act on an ambiguous lock is correct, but a silent refusal turns a recycled pid behind a stale lock into an away mode that can never start again, with nothing told to anyone: an unrecoverable silent failure is strictly worse than the bug it replaced. So every refusal here exits non-zero and names the exact lock path to remove.
 - `bin/fm-wake-lib.sh`: `fm_pid_home_matches` canonicalises both sides of the home and state comparison (`fm_path_canonical`). `FM_HOME` arrives spelled however the environment spells it - a trailing slash, a path through a symlink - while the no-override fallback returns the physically resolved root, so a raw string compare failed a home against its own watcher and sent `--restart` down the clear-the-lock branch. Canonicalising can only make attribution more accurate: an unresolvable path falls back to its literal form, so nothing new becomes signal-able.
 
 The predicate is not weakened. A killed watcher still reads unhealthy and still raises the banner.
@@ -133,12 +163,21 @@ Torn locks can no longer form now that identity publishes atomically, so this af
 - `test_pid_runs_command_matches_only_the_program_being_run` - a `tail -f` on `bin/fm-watch.sh` must not match as running it, or a recycled lock pid landing on such a process would be signalled by `--restart`.
 - `test_pid_home_matches_separates_state_override_domains` - two domains sharing a home root but separated by `FM_STATE_OVERRIDE` are different homes and cannot cross-signal.
 - `test_pid_identity_is_stable_across_reads` - one live pid must fingerprint byte-identically on every read, which is what the start-ticks fingerprint guarantees regardless of any boot-time recomputation.
+- `test_pid_identity_is_derived_from_start_ticks_not_lstart` - the discriminator itself, pinned so a refactor cannot quietly regress the cure: the fingerprint's start half IS `/proc/<pid>/stat` field 22 and is not `lstart`, and an `lstart`-derived fingerprint moves across a `btime` shift while this one does not. Skips where `/proc` is absent.
+- `test_watch_restart_clears_a_stale_lock_for_a_differently_spelled_home` - a home whose `FM_HOME` carries a trailing slash must still recognise and clear its OWN stale lock, or it can never re-arm behind one.
 - `test_unwritable_state_dir_with_a_live_holder_is_contention` - a full or read-only state dir under a LIVE holder must report contention, never "nothing is armed", or the repair path would terminate a healthy watcher because the disk is full.
 - `test_contention_after_a_failed_steal_mutex_reports_no_own_failure` - a contention return never carries `FM_LOCK_STAGE_FAILED` left over from the steal mutex's own failure; rc 1 and the own-failure flag are mutually exclusive.
 - `test_try_create_clears_stale_lock_signals_on_entry` - the same contract for direct callers of the `fm_lock_try_create` primitive, which clears the three lock signals on entry rather than relying on `fm_lock_try_acquire` to have done it.
 - `test_owner_dir_leaves_nothing_behind_when_a_stage_hook_writes_extra_files` - owner dirs are cleared generically on discard, so a stage hook writing any filename cannot strand `<lock>.owner.XXXXXX` dirs in the state dir - a slow path to the very full-state-dir condition above.
 
 The two restart-behavior tests skip on a platform without `/proc`, where the arm deliberately refuses to signal an unattributable holder and so has nothing to assert.
+
+`tests/fm-afk-launch.test.sh` and `tests/fm-daemon.test.sh` cover the same contract on the away-mode side, all skipping without `/proc`:
+
+- `test_afk_start_treats_an_unreadable_daemon_identity_as_held` - a live holder with a legacy fingerprint keeps its lock, no second daemon is exec'd, and the stand-down is non-zero and names the lock.
+- `unit_launch_lock_holds_on_unreadable_identity` - the launcher lock is never evicted from a live holder it cannot read, fails fast rather than waiting out a holder that may never let go, and still reclaims a dead one.
+- `unit_legacy_daemon_lock_fails_loudly` - `start` and `stop` both refuse non-zero and name the lock; an unattributable live holder is never signalled, and a refused `stop` leaves `state/.afk` in place.
+- `unit_legacy_daemon_lock_stops_an_attributed_daemon` - the other direction: a live holder attributed to this home IS stopped behind a legacy fingerprint, SIGTERMed while `state/.afk` is still present so its flush is not a no-op.
 
 ## Follow-on, 2026-07-13 - the `pgrep -f` miscount that reverted this fix
 
