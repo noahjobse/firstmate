@@ -53,12 +53,13 @@ fm_pid_identity() {
   cmd=$(LC_ALL=C ps -p "$pid" -o command= 2>/dev/null) || return 1
   [ -n "$cmd" ] || return 1
   # The start half must be byte-stable across reads, or a live watcher's own lock
-  # intermittently reads as a reused pid and supervision reports itself down. ps's
-  # lstart is not: it is derived from a boot-time estimate recomputed on every ps
-  # invocation, which shifts by a second or two on a clock-adjusting host (WSL2),
-  # so the same live pid fingerprints differently minutes apart. Prefer the kernel's
-  # boot-relative start ticks wherever /proc exists and keep lstart only as the
-  # fallback for hosts without it.
+  # reads as a reused pid and supervision reports itself down. lstart was measured
+  # stable for a fixed pid on this host (docs/incidents/2026-07-12-torn-watcher-lock.md)
+  # and did NOT cause that incident, but it is derived from a boot-time estimate
+  # recomputed on every ps invocation, so a host that recomputes btime across a
+  # suspend or a clock resync could still shift it. Defense in depth: prefer the
+  # kernel's boot-relative start ticks wherever /proc exists, which no clock
+  # adjustment can perturb, and keep lstart only as the fallback for hosts without it.
   start=$(fm_pid_start_ticks "$pid") \
     || start=$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null) \
     || return 1
@@ -415,10 +416,14 @@ fm_lock_own_failure_rc() {
 # leave supervision unarmed. The converse matters just as much: an existing lock
 # is checked first, and every own-failure path re-checks through
 # fm_lock_own_failure_rc, so a live holder is never downgraded to rc 2. Every
-# own-failure exit sets FM_LOCK_STAGE_FAILED.
+# own-failure exit sets FM_LOCK_STAGE_FAILED, and ONLY those: the three lock
+# signals are cleared on entry so a direct caller cannot read a flag left behind
+# by an earlier acquire.
 fm_lock_try_create() {
   local lockdir=$1 allowed_steal_owner=${2:-} stage_fn=${3:-} ownerdir
   FM_LOCK_OWNER_DIR=
+  FM_LOCK_HELD_PID=
+  FM_LOCK_STAGE_FAILED=
   if [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
     return 1
   fi

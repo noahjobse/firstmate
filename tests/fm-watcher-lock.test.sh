@@ -719,9 +719,10 @@ test_pid_identity_is_stable_across_reads() {
   # The identity is a fingerprint of ONE live process instance, so the same live pid
   # must fingerprint byte-identically every time or the lock's own holder eventually
   # reads as a reused pid and supervision reports itself down while a watcher is
-  # running. ps's lstart is recomputed from a boot-time estimate on every invocation
-  # and drifts by a second on a clock-adjusting host (WSL2), so the identity must not
-  # be derived from it where the kernel's own start ticks are readable.
+  # running. ps's lstart was measured stable for a fixed pid on the incident host, but
+  # it is recomputed from a boot-time estimate on every invocation, so a suspend or a
+  # clock resync could shift it; the identity is therefore derived from the kernel's
+  # own start ticks wherever they are readable, and this asserts that stability.
   local live baseline current i
   sleep 300 &
   live=$!
@@ -1094,6 +1095,38 @@ test_owner_dir_leaves_nothing_behind_when_a_stage_hook_writes_extra_files() {
   pass "owner dirs are cleared generically, so a stage hook's own filenames leak nothing"
 }
 
+test_try_create_clears_stale_lock_signals_on_entry() {
+  # fm_lock_try_create is a primitive in its own right, and callers reach it directly.
+  # Its contract is that ONLY an own failure sets FM_LOCK_STAGE_FAILED, so it must
+  # clear the three lock signals on entry: a flag left behind by an earlier failed
+  # acquire would otherwise be read as this call's outcome, which is the stale-signal
+  # class that produced the misclassification outages in the first place.
+  local dir state out
+  dir=$(make_case try-create-clears-signals)
+  state="$dir/state"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1/$2 are the probe shell's own positional args
+  out=$(timeout 20 env FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    FM_LOCK_STAGE_FAILED=1
+    FM_LOCK_HELD_PID=9999
+    fm_lock_try_create "$2/.fresh.lock"
+    printf "fresh rc=%s staged_failed=[%s] held=[%s]\n" "$?" "${FM_LOCK_STAGE_FAILED:-}" "${FM_LOCK_HELD_PID:-}"
+    FM_LOCK_STAGE_FAILED=1
+    FM_LOCK_HELD_PID=9999
+    fm_lock_try_create "$2/.fresh.lock"
+    printf "taken rc=%s staged_failed=[%s] held=[%s]\n" "$?" "${FM_LOCK_STAGE_FAILED:-}" "${FM_LOCK_HELD_PID:-}"
+  ' _ "$LIB" "$state" 2>&1)
+  case "$out" in
+    *"fresh rc=0 staged_failed=[] held=[]"*) ;;
+    *) fail "fm_lock_try_create carried a stale own-failure signal into a successful create: $out" ;;
+  esac
+  case "$out" in
+    *"taken rc=1 staged_failed=[] held=[]"*) ;;
+    *) fail "fm_lock_try_create carried a stale own-failure signal into a contention return: $out" ;;
+  esac
+  pass "fm_lock_try_create clears stale lock signals on entry"
+}
+
 test_watch_fails_loudly_when_the_state_dir_is_unwritable() {
   # Same cause, seen from the watcher: no lock exists and nothing was armed, so it
   # must exit non-zero and say so, never "already running".
@@ -1257,6 +1290,7 @@ test_lock_acquire_fails_closed_on_an_unwritable_state_dir
 test_unwritable_state_dir_with_a_live_holder_is_contention
 test_contention_after_a_failed_steal_mutex_reports_no_own_failure
 test_owner_dir_leaves_nothing_behind_when_a_stage_hook_writes_extra_files
+test_try_create_clears_stale_lock_signals_on_entry
 test_watch_fails_loudly_when_the_state_dir_is_unwritable
 test_pid_runs_command_matches_only_the_program_being_run
 test_pid_runs_command_matches_a_program_path_containing_spaces
