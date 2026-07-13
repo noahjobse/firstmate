@@ -74,27 +74,50 @@ fm_pid_identity() {
   printf '%s %s\n' "$start" "$cmd" | sed 's/^[[:space:]]*//'
 }
 
-# Which format fm_pid_identity produces for <pid> on THIS host: "ticks" where the
-# kernel exposes the pid's start ticks (/proc), "lstart" where it does not.
-fm_pid_identity_format() {
-  local pid=$1
-  if fm_pid_start_ticks "$pid" >/dev/null 2>&1; then
+# Whether THIS host exposes start ticks at all, asked of a pid that is certainly
+# alive and certainly ours. Host capability and one pid's readability are separate
+# questions: a pid whose /proc entry is missing has either exited or is hidden
+# from us, and neither means the host produces lstart identities.
+fm_host_identity_format() {
+  # $$ and not fm_current_pid: fm_current_pid reports the pid of whatever subshell
+  # evaluates it, and a command substitution's subshell has already exited by the
+  # time its /proc entry is read, which would report a Linux host as lstart-only.
+  if fm_pid_start_ticks "$$" >/dev/null 2>&1; then
     printf 'ticks\n'
   else
     printf 'lstart\n'
   fi
 }
 
-# True when the start half of a RECORDED identity is in the format this host
-# currently produces: all digits for ticks, anything else for lstart. This is not
+# Which format fm_pid_identity produces for <pid>: "ticks" where the kernel
+# exposes that pid's start ticks (/proc), "lstart" on a host with no /proc at all.
+# Returns non-zero, printing nothing, when the host DOES expose start ticks but
+# this pid's stat cannot be read - the pid exited under us, or its /proc entry is
+# hidden - because that is an unknown format, not an lstart one. Inferring
+# "lstart" there would make a ticks identity look like a legacy one and send the
+# caller a manual-remediation instruction for a holder that is simply gone.
+fm_pid_identity_format() {
+  local pid=$1
+  if fm_pid_start_ticks "$pid" >/dev/null 2>&1; then
+    printf 'ticks\n'
+    return 0
+  fi
+  [ "$(fm_host_identity_format)" = lstart ] || return 1
+  printf 'lstart\n'
+}
+
+# Whether the start half of a RECORDED identity is in the format this host
+# currently produces, in three states: 0 it is, 1 it is a legacy format this code
+# no longer produces, 2 the format cannot be determined for this pid. This is not
 # a dual-format compare - an identity in the other format is never accepted as a
 # match, only reported as unreadable - so a caller can tell a different process
 # apart from a holder this code cannot identify at all.
 fm_identity_is_current_format() {
-  local pid=$1 identity=$2 head
+  local pid=$1 identity=$2 head format
   [ -n "$identity" ] || return 1
+  format=$(fm_pid_identity_format "$pid") || return 2
   head=${identity%%[[:space:]]*}
-  case "$(fm_pid_identity_format "$pid")" in
+  case "$format" in
     ticks)
       case "$head" in
         ''|*[!0-9]*) return 1 ;;
@@ -121,12 +144,22 @@ fm_identity_is_current_format() {
 # picks the fail-closed direction for what it is about to do: a caller about to
 # EVICT a lock or start a second supervisor treats 2 as still held, and a caller
 # about to SIGNAL the pid treats 2 as not ours.
+# A pid that exits mid-check reports 1, not 2: every read below can fail simply
+# because the process went away between the aliveness check and the read, and a
+# holder that is merely DEAD is provably not the holder. Only a pid still alive
+# after a failed read is genuinely unidentifiable.
 fm_pid_matches_identity() {
   local pid=$1 identity=$2 current
   [ -n "$identity" ] || return 1
   fm_pid_alive "$pid" || return 1
-  fm_identity_is_current_format "$pid" "$identity" || return 2
-  current=$(fm_pid_identity "$pid") || return 2
+  if ! fm_identity_is_current_format "$pid" "$identity"; then
+    fm_pid_alive "$pid" || return 1
+    return 2
+  fi
+  if ! current=$(fm_pid_identity "$pid"); then
+    fm_pid_alive "$pid" || return 1
+    return 2
+  fi
   [ "$current" = "$identity" ]
 }
 
@@ -145,6 +178,20 @@ fm_path_canonical() {
     path=${path%/}
   done
   printf '%s\n' "$path"
+}
+
+# The same normalisation for a FILE path: its directory as the filesystem sees it,
+# plus the file's own name. The script path recorded in a lock is compared against
+# the path the reader was invoked with, and those two spellings of one script (a
+# symlinked bin dir, a trailing-slash-differing invocation) must compare equal or
+# a live watcher reads as a stranger.
+fm_path_canonical_file() {
+  local path=$1 dir base
+  [ -n "$path" ] || return 1
+  base=$(basename -- "$path")
+  dir=$(fm_path_canonical "$(dirname -- "$path")") || return 1
+  [ "$dir" = / ] && dir=
+  printf '%s/%s\n' "$dir" "$base"
 }
 
 fm_path_mtime() {
@@ -318,8 +365,9 @@ fm_watcher_lock_matches_pid() {
   lock_home=$(cat "$lockdir/fm-home" 2>/dev/null || true)
   lock_path=$(cat "$lockdir/watcher-path" 2>/dev/null || true)
   lock_identity=$(cat "$lockdir/pid-identity" 2>/dev/null || true)
+  [ -n "$lock_path" ] || return 1
   [ "$(fm_path_canonical "$lock_home")" = "$(fm_path_canonical "$home")" ] || return 1
-  [ "$lock_path" = "$watch_path" ] || return 1
+  [ "$(fm_path_canonical_file "$lock_path")" = "$(fm_path_canonical_file "$watch_path")" ] || return 1
   [ -n "$lock_identity" ] || return 1
   fm_pid_matches_identity "$pid" "$lock_identity"
 }

@@ -1396,7 +1396,69 @@ test_pid_home_matches_is_path_representation_independent() {
   pass "fm_pid_home_matches attributes a home spelled with a trailing slash or through a symlink"
 }
 
+test_watcher_lock_path_compare_is_path_representation_independent() {
+  # The lock's watcher-path and the path the reader was invoked with are two
+  # spellings of one script when the bin dir is reached through a symlink. A raw
+  # compare fails a live watcher against its own lock, and restart then clears
+  # that lock instead of stopping the watcher.
+  local dir state bin_link identity peer_pid probe
+  dir=$(make_case lock-path-spelling)
+  state="$dir/state"
+  bin_link="$dir/bin-link"
+  ln -s "$ROOT/bin" "$bin_link"
+  sleep 30 &
+  peer_pid=$!
+  sleep 0.2
+  identity=$(bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$peer_pid")
+  mkdir -p "$state/.watch.lock"
+  printf '%s\n' "$peer_pid" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$bin_link/fm-watch.sh" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1..$5 are the probe shell's own positional args
+  probe='. "$1"; if fm_watcher_lock_matches_pid "$2" "$3" "$4" "$5"; then echo match; else echo "rc$?"; fi'
+  [ "$(bash -c "$probe" _ "$LIB" "$state" "$WATCH" "$peer_pid" "$dir")" = match ] \
+    || fail "a watcher-path recorded through a symlinked bin dir was not matched against its own watcher"
+  [ "$(bash -c "$probe" _ "$LIB" "$state" "$ROOT/bin/fm-guard.sh" "$peer_pid" "$dir")" = rc1 ] \
+    || fail "normalisation matched a lock recording a different script"
+  kill "$peer_pid" 2>/dev/null || true
+  wait "$peer_pid" 2>/dev/null || true
+  pass "fm_watcher_lock_matches_pid matches a watcher path spelled through a symlink, and still rejects another script"
+}
+
+test_dead_pid_is_provably_not_the_holder_not_unidentifiable() {
+  # A holder that has simply exited must report 1 (reclaimable), never 2. Format
+  # is inferred from /proc, so a dead pid's missing stat used to look like an
+  # lstart-format host: a ticks identity then read as legacy, and the caller told
+  # the captain to remove by hand a lock that needed no remediation.
+  local dir dead_pid identity rc
+  dir=$(make_case dead-pid-identity)
+  if [ ! -r "/proc/$$/stat" ]; then
+    echo "skip: identity format inference needs /proc (Linux)"
+    pass "fm_pid_matches_identity reports a dead holder as reclaimable (skipped: no /proc)"
+    return
+  fi
+  sleep 30 &
+  dead_pid=$!
+  sleep 0.2
+  identity=$(bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$dead_pid")
+  case "${identity%%[[:space:]]*}" in
+    ''|*[!0-9]*) fail "expected a start-ticks identity on a /proc host, got '$identity'" ;;
+  esac
+  kill "$dead_pid" 2>/dev/null || true
+  wait "$dead_pid" 2>/dev/null || true
+  bash -c '. "$1"; fm_pid_identity_format "$2"' _ "$LIB" "$dead_pid" >/dev/null 2>&1 \
+    && fail "a dead pid's identity format was reported as knowable"
+  rc=0
+  bash -c '. "$1"; fm_pid_matches_identity "$2" "$3"' _ "$LIB" "$dead_pid" "$identity" || rc=$?
+  [ "$rc" -eq 1 ] || fail "a dead holder should be provably not the holder (1), got $rc"
+  rm -rf "$dir"
+  pass "fm_pid_matches_identity reports a dead holder as reclaimable, never as unidentifiable"
+}
+
 test_singleton_start
+test_watcher_lock_path_compare_is_path_representation_independent
+test_dead_pid_is_provably_not_the_holder_not_unidentifiable
 test_pid_identity_is_locale_invariant
 test_pid_identity_is_stable_across_reads
 test_pid_identity_is_derived_from_start_ticks_not_lstart
