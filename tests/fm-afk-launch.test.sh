@@ -622,6 +622,44 @@ unit_lock_requires_complete_metadata() {
   rm -rf "$st"
 }
 
+unit_lock_reclaim_is_loud_when_removal_fails() {
+  local st rc err
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-lock-reclaim.XXXXXX")
+  mkdir -p "$st/state/.afk-launch.lock"
+  : > "$st/state/.afk-launch.lock/unexpected-file"
+  err=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    fm_afk_launch_remove_reclaimable_lock
+    exit $?
+  ' _ "$LAUNCH" 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ] && [ -e "$st/state/.afk-launch.lock/unexpected-file" ] \
+    && printf '%s' "$err" | grep -Fq "$st/state/.afk-launch.lock"; then
+    pass "launcher lock: failed reclaim exits loudly with the exact lock path"
+  else
+    fail "launcher lock: failed reclaim rc=$rc err=[$err]"
+  fi
+  rm -rf "$st"
+}
+
+unit_lock_reclaim_tolerates_vanished_lock() {
+  local st rc err
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-lock-vanished.XXXXXX")
+  mkdir -p "$st/state"
+  err=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    fm_afk_launch_remove_reclaimable_lock
+    exit $?
+  ' _ "$LAUNCH" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ] && [ -z "$err" ]; then
+    pass "launcher lock: vanished reclaim lock is treated as already removed"
+  else
+    fail "launcher lock: vanished reclaim lock rc=$rc err=[$err]"
+  fi
+  rm -rf "$st"
+}
+
 unit_launch_lock_holds_on_unreadable_identity() {
   # A launcher that started before an in-place update fingerprinted itself in the
   # old identity format. The acquire loop REMOVES a lock it reads as unowned, so an
@@ -1083,6 +1121,8 @@ unit_stop_malformed_record_fails_closed
 unit_tmux_planned_record_and_collision
 unit_stop_validates_before_signal
 unit_lock_requires_complete_metadata
+unit_lock_reclaim_is_loud_when_removal_fails
+unit_lock_reclaim_tolerates_vanished_lock
 unit_launch_lock_holds_on_unreadable_identity
 unit_legacy_daemon_lock_fails_loudly
 unit_legacy_daemon_lock_stops_an_attributed_daemon

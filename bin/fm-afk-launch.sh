@@ -130,6 +130,16 @@ fm_afk_launch_stage_lock_meta() {
   [ -s "$ownerdir/pid-identity" ]
 }
 
+fm_afk_launch_remove_reclaimable_lock() {
+  [ -e "$FM_AFK_LAUNCH_LOCK" ] || [ -L "$FM_AFK_LAUNCH_LOCK" ] || return 0
+  if fm_lock_remove_path "$FM_AFK_LAUNCH_LOCK" 2>/dev/null; then
+    return 0
+  fi
+  [ -e "$FM_AFK_LAUNCH_LOCK" ] || [ -L "$FM_AFK_LAUNCH_LOCK" ] || return 0
+  fm_afk_launch_log "launcher lock $FM_AFK_LAUNCH_LOCK is reclaimable but could not be removed; remove $FM_AFK_LAUNCH_LOCK and retry."
+  return 1
+}
+
 fm_afk_launch_lock_acquire() {
   local i incomplete=0 pid lock_state create_rc
   mkdir -p "$FM_AFK_LAUNCH_STATE" || return 1
@@ -163,7 +173,7 @@ fm_afk_launch_lock_acquire() {
       return 1
     fi
     if [ "$lock_state" -ne 0 ]; then
-      fm_lock_remove_path "$FM_AFK_LAUNCH_LOCK" 2>/dev/null || return 1
+      fm_afk_launch_remove_reclaimable_lock || return 1
       incomplete=0
       continue
     fi
