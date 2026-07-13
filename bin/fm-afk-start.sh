@@ -81,13 +81,16 @@ daemon_lock_owner() {
   printf '%s\n' "$FM_AFK_LOCK"
 }
 
+# 0 when <pid> is provably the daemon that took this lock, 1 when it is provably a
+# different process, and 2 when the recorded identity cannot be identified at all
+# (fm_pid_matches_identity): a daemon that fingerprinted itself before an in-place
+# update records its identity in a format this code no longer produces.
 daemon_pid_matches() {
-  local pid=$1 owner=$2 identity current command
+  local pid=$1 owner=$2 identity command rc=0
   identity=$(cat "$owner/pid-identity" 2>/dev/null || true)
   if [ -n "$identity" ]; then
-    current=$(fm_pid_identity "$pid") || return 1
-    [ "$current" = "$identity" ]
-    return
+    fm_pid_matches_identity "$pid" "$identity" || rc=$?
+    return "$rc"
   fi
   command=$(ps -p "$pid" -o command= 2>/dev/null || true)
   case "$command" in
@@ -102,12 +105,23 @@ daemon_lock_pid() {
   cat "$owner/pid" 2>/dev/null || true
 }
 
-daemon_lock_held_by_live_daemon() {
-  local owner pid
+# The lock's three states, mirroring daemon_pid_matches: 0 held by a live,
+# positively identified daemon; 1 no live holder (no lock, a dead pid, or a live
+# pid that is provably not the daemon); 2 a LIVE holder this code cannot identify.
+# Every caller reads it as a plain predicate, so only 0 is truthy: nothing signals
+# or trusts a holder it cannot identify. A caller that would EVICT the lock must
+# additionally treat 2 as held (see fm_afk_start_main).
+daemon_lock_state() {
+  local owner pid rc=0
   owner=$(daemon_lock_owner) || return 1
   pid=$(cat "$owner/pid" 2>/dev/null || true)
   fm_pid_alive "$pid" || return 1
-  daemon_pid_matches "$pid" "$owner"
+  daemon_pid_matches "$pid" "$owner" || rc=$?
+  return "$rc"
+}
+
+daemon_lock_held_by_live_daemon() {
+  daemon_lock_state
 }
 
 fm_afk_start_main() {
@@ -124,10 +138,21 @@ fm_afk_start_main() {
     date '+%s' > "$FM_AFK_STATE/.afk"
   fi
 
-  local pid
+  local pid lock_state=0
   pid=$(daemon_lock_pid 2>/dev/null || true)
-  if daemon_lock_held_by_live_daemon; then
+  daemon_lock_state || lock_state=$?
+  if [ "$lock_state" -eq 0 ]; then
     echo "afk: daemon already running pid=$pid"
+    return 0
+  fi
+  # An unidentifiable LIVE holder is treated as still holding the lock. Reading it
+  # as dead would remove its lock and exec a SECOND daemon beside the live one -
+  # duplicate escalations into the captain's session - and "an ambiguous identity
+  # means the holder is gone" is the very assumption that killed a live watcher in
+  # docs/incidents/2026-07-12-torn-watcher-lock.md. Only a holder we can prove is
+  # not the daemon (lock_state 1) is ever reclaimed.
+  if [ "$lock_state" -eq 2 ]; then
+    echo "afk: daemon lock held by live pid=$pid whose identity this version cannot read; not starting a second daemon"
     return 0
   fi
 

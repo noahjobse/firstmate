@@ -151,7 +151,9 @@ unit_stop_rejects_reused_pid() {
   lock="$st/state/.supervise-daemon.lock"
   mkdir -p "$lock"
   printf '%s' "$sleeper_pid" > "$lock/pid"
-  printf 'different-process-identity' > "$lock/pid-identity"
+  # A well-formed fingerprint of a DIFFERENT process (this test shell): the lock's
+  # pid was recycled onto an unrelated live process, which stop must never signal.
+  ( . "$ROOT/bin/fm-wake-lib.sh"; fm_pid_identity "$$" > "$lock/pid-identity" )
   FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop >/dev/null 2>&1
   if kill -0 "$sleeper_pid" 2>/dev/null; then
     pass "stop identity: stale lock cannot signal an unrelated live process"
@@ -620,6 +622,40 @@ unit_lock_requires_complete_metadata() {
   rm -rf "$st"
 }
 
+unit_launch_lock_holds_on_unreadable_identity() {
+  # A launcher that started before an in-place update fingerprinted itself in the
+  # old identity format. The acquire loop REMOVES a lock it reads as unowned, so an
+  # identity this version cannot read must count as owned: never evict a live
+  # holder, never run two launchers at once. A dead holder is still reclaimed.
+  local st sleeper_pid owned stale
+  if [ ! -r "/proc/$$/stat" ]; then
+    echo "skip: the legacy-identity transition needs the /proc start-ticks format (Linux)"
+    return 0
+  fi
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-launch-legacy.XXXXXX")
+  mkdir -p "$st/state/.afk-launch.lock"
+  sleep 30 &
+  sleeper_pid=$!
+  printf '%s' "$sleeper_pid" > "$st/state/.afk-launch.lock/pid"
+  printf 'Sun Jul 12 17:35:56 2026 sleep 30\n' > "$st/state/.afk-launch.lock/pid-identity"
+  owned=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    if fm_afk_launch_lock_owned; then echo owned; else echo unowned; fi
+  ' _ "$LAUNCH")
+  kill "$sleeper_pid" 2>/dev/null || true
+  wait "$sleeper_pid" 2>/dev/null || true
+  stale=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    if fm_afk_launch_lock_owned; then echo owned; else echo unowned; fi
+  ' _ "$LAUNCH")
+  if [ "$owned" = owned ] && [ "$stale" = unowned ]; then
+    pass "launcher lock: a live holder with an unreadable identity is held, a dead one is reclaimed"
+  else
+    fail "launcher lock: unreadable identity live=$owned dead=$stale (want owned/unowned)"
+  fi
+  rm -rf "$st"
+}
+
 unit_stop_surfaces_afk_removal_failure() {
   local st
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-stop-remove.XXXXXX")
@@ -884,6 +920,7 @@ unit_stop_malformed_record_fails_closed
 unit_tmux_planned_record_and_collision
 unit_stop_validates_before_signal
 unit_lock_requires_complete_metadata
+unit_launch_lock_holds_on_unreadable_identity
 unit_stop_surfaces_afk_removal_failure
 unit_stop_confirms_daemon_exit
 unit_refresh_validates_record

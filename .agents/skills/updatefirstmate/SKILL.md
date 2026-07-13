@@ -61,3 +61,4 @@ This touches only the firstmate repo and its own worktrees, never anything under
 - **One accepted post-update bark.**
   An update that crosses the watcher-lock identity change (`docs/incidents/2026-07-12-torn-watcher-lock.md`) leaves a still-running pre-update watcher fingerprinted in the old format, so a home reads as having no live watcher until one `bin/fm-watch-arm.sh --restart` cycle replaces it.
   That is expected once per updated home, not a real supervision outage; repair it through the emitted harness protocol rather than a broad `pkill`.
+  The away-mode daemon and launcher locks cross the same identity change and fail closed instead: a live pre-update holder whose fingerprint this version cannot read counts as still holding its lock, so an update never evicts it and never starts a second daemon beside it.

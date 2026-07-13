@@ -68,6 +68,79 @@ fm_pid_identity() {
   printf '%s %s\n' "$start" "$cmd" | sed 's/^[[:space:]]*//'
 }
 
+# Which format fm_pid_identity produces for <pid> on THIS host: "ticks" where the
+# kernel exposes the pid's start ticks (/proc), "lstart" where it does not.
+fm_pid_identity_format() {
+  local pid=$1
+  if fm_pid_start_ticks "$pid" >/dev/null 2>&1; then
+    printf 'ticks\n'
+  else
+    printf 'lstart\n'
+  fi
+}
+
+# True when the start half of a RECORDED identity is in the format this host
+# currently produces: all digits for ticks, anything else for lstart. This is not
+# a dual-format compare - an identity in the other format is never accepted as a
+# match, only reported as unreadable - so a caller can tell a different process
+# apart from a holder this code cannot identify at all.
+fm_identity_is_current_format() {
+  local pid=$1 identity=$2 head
+  [ -n "$identity" ] || return 1
+  head=${identity%%[[:space:]]*}
+  case "$(fm_pid_identity_format "$pid")" in
+    ticks)
+      case "$head" in
+        ''|*[!0-9]*) return 1 ;;
+      esac
+      ;;
+    *)
+      case "$head" in
+        ''|*[!0-9]*) ;;
+        *) return 1 ;;
+      esac
+      ;;
+  esac
+  return 0
+}
+
+# Check a live pid against a lock's recorded identity, in three states:
+#   0 the pid IS the holder that recorded this identity;
+#   1 the pid is provably NOT that holder (it is dead, or a different live process);
+#   2 the holder cannot be identified - the recorded identity is in a format this
+#     code no longer produces (written by a holder that started before an in-place
+#     update), or ps cannot fingerprint the live pid.
+# Ambiguity must never be read as "dead". That assumption is what evicted a live
+# watcher in docs/incidents/2026-07-12-torn-watcher-lock.md, so every consumer
+# picks the fail-closed direction for what it is about to do: a caller about to
+# EVICT a lock or start a second supervisor treats 2 as still held, and a caller
+# about to SIGNAL the pid treats 2 as not ours.
+fm_pid_matches_identity() {
+  local pid=$1 identity=$2 current
+  [ -n "$identity" ] || return 1
+  fm_pid_alive "$pid" || return 1
+  fm_identity_is_current_format "$pid" "$identity" || return 2
+  current=$(fm_pid_identity "$pid") || return 2
+  [ "$current" = "$identity" ]
+}
+
+# A path as the filesystem sees it, so two spellings of one directory compare
+# equal. An unresolvable path falls back to its literal form with trailing slashes
+# trimmed, so normalisation can only make a comparison more accurate; it never
+# makes two genuinely different paths compare equal.
+fm_path_canonical() {
+  local path=$1 resolved
+  [ -n "$path" ] || return 1
+  if resolved=$(cd -P "$path" 2>/dev/null && pwd -P); then
+    printf '%s\n' "$resolved"
+    return 0
+  fi
+  while [ "$path" != "/" ] && [ "$path" != "${path%/}" ]; do
+    path=${path%/}
+  done
+  printf '%s\n' "$path"
+}
+
 fm_path_mtime() {
   if [ "$(uname)" = Darwin ]; then
     stat -f %m "$1" 2>/dev/null
@@ -212,27 +285,37 @@ fm_pid_resolved_state() {
 # .watch.lock. Attribution therefore compares the target's resolved STATE as well
 # as its home; a process whose lock lives elsewhere is a different domain and must
 # never be signalled from here.
+# Both sides are canonicalised because they arrive spelled differently: FM_HOME is
+# whatever the captain's environment says, trailing slash and symlinks included,
+# while the no-override fallback returns the physically resolved
+# FM_WAKE_DEFAULT_ROOT. A raw string compare therefore fails a home against its
+# OWN watcher, and the caller then treats a live, attributable watcher as a
+# stranger and yanks its lock instead of stopping it.
 fm_pid_home_matches() {
   local pid=$1 home=$2 state=${3:-$STATE} default_root=${4:-$FM_WAKE_DEFAULT_ROOT} pid_home
   [ -n "$home" ] || return 1
   fm_pid_alive "$pid" || return 1
   fm_pid_home_readable "$pid" || return 1
   pid_home=$(fm_pid_resolved_home "$pid" "$default_root")
-  [ "$pid_home" = "$home" ] || return 1
-  [ "$(fm_pid_resolved_state "$pid" "$pid_home")" = "$state" ]
+  [ "$(fm_path_canonical "$pid_home")" = "$(fm_path_canonical "$home")" ] || return 1
+  [ "$(fm_path_canonical "$(fm_pid_resolved_state "$pid" "$pid_home")")" = "$(fm_path_canonical "$state")" ]
 }
 
+# 0 when the lock positively vouches for <pid> as this home's watcher, 2 when the
+# recorded identity cannot be identified (fm_pid_matches_identity), 1 otherwise.
+# Callers that vouch for a watcher (fm_watcher_healthy) accept only 0, so an
+# unidentifiable holder is never reported healthy; callers that would evict or
+# signal read the distinction and fail closed.
 fm_watcher_lock_matches_pid() {
-  local state=$1 watch_path=$2 pid=$3 home=${4:-$FM_HOME} lockdir lock_home lock_path lock_identity current_identity
+  local state=$1 watch_path=$2 pid=$3 home=${4:-$FM_HOME} lockdir lock_home lock_path lock_identity
   lockdir="$state/.watch.lock"
   lock_home=$(cat "$lockdir/fm-home" 2>/dev/null || true)
   lock_path=$(cat "$lockdir/watcher-path" 2>/dev/null || true)
   lock_identity=$(cat "$lockdir/pid-identity" 2>/dev/null || true)
-  [ "$lock_home" = "$home" ] || return 1
+  [ "$(fm_path_canonical "$lock_home")" = "$(fm_path_canonical "$home")" ] || return 1
   [ "$lock_path" = "$watch_path" ] || return 1
   [ -n "$lock_identity" ] || return 1
-  current_identity=$(fm_pid_identity "$pid") || return 1
-  [ "$current_identity" = "$lock_identity" ]
+  fm_pid_matches_identity "$pid" "$lock_identity"
 }
 
 FM_WATCHER_HEALTHY_PID=

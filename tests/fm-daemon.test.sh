@@ -55,17 +55,25 @@ test_afk_start_ignores_stale_pidfile_without_lock() {
 }
 
 test_afk_start_reclaims_stale_daemon_lock_reused_pid() {
-  local dir state out status lock
+  local dir state out status lock peer
   dir=$(make_supercase afk-start-stale-lock-reused-pid)
   state="$dir/state"
   lock="$state/.supervise-daemon.lock"
   mkdir -p "$lock"
+  # A recycled pid: the lock names a live process, and the identity it recorded is
+  # a well-formed fingerprint of some OTHER process. That is provably not our
+  # daemon, so the lock is reclaimable.
+  sleep 60 &
+  peer=$!
   printf '%s\n' "$$" > "$state/.supervise-daemon.pid"
   printf '%s\n' "$$" > "$lock/pid"
-  printf '%s\n' "stale daemon identity" > "$lock/pid-identity"
+  bash -c '. "$1"; fm_pid_identity "$2"' _ "$ROOT/bin/fm-wake-lib.sh" "$peer" > "$lock/pid-identity" \
+    || fail "could not fingerprint the peer pid"
 
   out=$(FM_STATE_OVERRIDE="$state" FM_SUPERVISOR_BACKEND=unsupported "$AFK_START" 2>&1)
   status=$?
+  kill "$peer" 2>/dev/null || true
+  wait "$peer" 2>/dev/null || true
 
   [ "$status" -ne 0 ] || fail "fm-afk-start.sh should attempt daemon startup after rejecting a reused-pid lock"
   assert_contains "$out" "starting supervise daemon" "fm-afk-start.sh did not attempt daemon startup after rejecting the stale lock"
@@ -73,6 +81,33 @@ test_afk_start_reclaims_stale_daemon_lock_reused_pid() {
   assert_not_contains "$out" "daemon already running" "fm-afk-start.sh trusted a stale daemon lock with a reused pid"
   assert_not_contains "$out" "another fm-supervise-daemon is already running" "daemon singleton lock still trusted the reused pid"
   pass "fm-afk-start.sh reclaims stale daemon locks whose live pid identity no longer matches"
+}
+
+test_afk_start_treats_an_unreadable_daemon_identity_as_held() {
+  # A daemon that started BEFORE an in-place update fingerprinted itself in the
+  # old identity format (ps lstart, before the /proc start-ticks fingerprint).
+  # Reading that as "dead" would evict a LIVE daemon's lock and exec a second
+  # daemon beside it. Ambiguity means held.
+  local dir state out status lock
+  [ -r "/proc/$$/stat" ] || {
+    echo "skip: the legacy-identity transition needs the /proc start-ticks format (Linux)"
+    return 0
+  }
+  dir=$(make_supercase afk-start-legacy-identity)
+  state="$dir/state"
+  lock="$state/.supervise-daemon.lock"
+  mkdir -p "$lock"
+  printf '%s\n' "$$" > "$lock/pid"
+  printf 'Sun Jul 12 17:35:56 2026 bash %s\n' "$ROOT/bin/fm-supervise-daemon.sh" > "$lock/pid-identity"
+
+  out=$(FM_STATE_OVERRIDE="$state" FM_SUPERVISOR_BACKEND=unsupported "$AFK_START" 2>&1)
+  status=$?
+
+  [ "$status" -eq 0 ] || fail "fm-afk-start.sh should stand down on an unreadable identity, not fail: $out"
+  assert_contains "$out" "not starting a second daemon" "fm-afk-start.sh did not report the unreadable live holder"
+  assert_not_contains "$out" "starting supervise daemon" "fm-afk-start.sh started a SECOND daemon beside a live one it could not identify"
+  assert_present "$lock/pid" "fm-afk-start.sh evicted the lock of a live daemon it could not identify"
+  pass "fm-afk-start.sh treats a live holder with an unreadable identity as still holding the lock"
 }
 
 test_daemon_state_root_uses_fm_home() {
@@ -1656,6 +1691,7 @@ test_inject_msg_defers_on_dead_shell_unknown() {
 test_afk_start_refuses_when_flag_cannot_be_written
 test_afk_start_ignores_stale_pidfile_without_lock
 test_afk_start_reclaims_stale_daemon_lock_reused_pid
+test_afk_start_treats_an_unreadable_daemon_identity_as_held
 test_daemon_state_root_uses_fm_home
 test_classify_routine_signal_self
 test_classify_terminal_signal_escalates

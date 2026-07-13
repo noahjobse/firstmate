@@ -1283,9 +1283,42 @@ test_pid_home_matches_separates_state_override_domains() {
   pass "fm_pid_home_matches treats a different FM_STATE_OVERRIDE as a different home"
 }
 
+test_pid_home_matches_is_path_representation_independent() {
+  # FM_HOME is whatever the environment spells it as - a trailing slash, a symlink -
+  # while the library's own no-override fallback is physically resolved. A raw
+  # string compare fails a home against its OWN watcher, and restart then treats a
+  # live, attributable watcher as a stranger and yanks its lock instead of stopping
+  # it: the outage this branch exists to eliminate.
+  local dir home link peer_pid probe
+  dir=$(make_case home-path-spelling)
+  home="$dir/home"
+  link="$dir/home-link"
+  mkdir -p "$home/state"
+  ln -s "$home" "$link"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1..$4 are the probe shell's own positional args
+  probe='. "$1"; if fm_pid_home_matches "$2" "$3" "$4"; then echo match; else echo nomatch; fi'
+  FM_HOME="$home" sleep 30 &
+  peer_pid=$!
+  sleep 0.2
+  if [ -r "/proc/$peer_pid/environ" ]; then
+    [ "$(bash -c "$probe" _ "$LIB" "$peer_pid" "$home/" "$home/state")" = match ] \
+      || fail "a trailing-slash FM_HOME was not attributed to its own watcher"
+    [ "$(bash -c "$probe" _ "$LIB" "$peer_pid" "$link" "$link/state")" = match ] \
+      || fail "a symlinked FM_HOME was not attributed to its own watcher"
+    [ "$(bash -c "$probe" _ "$LIB" "$peer_pid" "$dir/other" "$dir/other/state")" = nomatch ] \
+      || fail "normalisation attributed a process to a home that is not its own"
+  else
+    echo "skip: home attribution needs /proc (Linux)"
+  fi
+  kill "$peer_pid" 2>/dev/null || true
+  wait "$peer_pid" 2>/dev/null || true
+  pass "fm_pid_home_matches attributes a home spelled with a trailing slash or through a symlink"
+}
+
 test_singleton_start
 test_pid_identity_is_locale_invariant
 test_pid_identity_is_stable_across_reads
+test_pid_home_matches_is_path_representation_independent
 test_lock_acquire_fails_closed_on_an_unwritable_state_dir
 test_unwritable_state_dir_with_a_live_holder_is_contention
 test_contention_after_a_failed_steal_mutex_reports_no_own_failure

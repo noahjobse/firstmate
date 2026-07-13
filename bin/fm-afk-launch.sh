@@ -67,13 +67,20 @@ set +e
 
 fm_afk_launch_log() { printf 'fm-afk-launch: %s\n' "$*" >&2; }
 
+# True when the launcher lock is still held: by a live launcher we can positively
+# identify, OR by a live launcher whose recorded identity is in a format this
+# version cannot read (one that started before an in-place update). The caller
+# removes a lock this reports as unowned, so ambiguity must count as owned - the
+# alternative is evicting a live launcher's lock and running two launchers at once.
+# A dead holder still fails this (fm_pid_matches_identity checks liveness first),
+# so a genuinely stale lock is still reclaimed.
 fm_afk_launch_lock_owned() {
-  local pid expected actual
+  local pid expected rc=0
   [ -d "$FM_AFK_LAUNCH_LOCK" ] || return 1
   pid=$(cat "$FM_AFK_LAUNCH_LOCK/pid" 2>/dev/null) || return 1
   expected=$(cat "$FM_AFK_LAUNCH_LOCK/pid-identity" 2>/dev/null) || return 1
-  actual=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
-  [ -n "$expected" ] && [ "$actual" = "$expected" ]
+  fm_pid_matches_identity "$pid" "$expected" || rc=$?
+  [ "$rc" -ne 1 ]
 }
 
 fm_afk_launch_lock_acquire() {
