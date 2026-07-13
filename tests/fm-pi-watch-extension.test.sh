@@ -2,6 +2,12 @@
 # Tests for the tracked Pi primary watcher extension and Pi secondmate wiring.
 set -u
 
+# The plugin tests assert the plugin itself prints nothing. Node's own process
+# warnings (e.g. MODULE_TYPELESS_PACKAGE_JSON, raised when a typeless
+# package.json sits anywhere above the checkout) are not plugin output, so keep
+# them out of the captured streams.
+export NODE_NO_WARNINGS=1
+
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
