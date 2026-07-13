@@ -139,7 +139,16 @@ if [ "$mode" = restart ]; then
   # Home-scoped stop: only the watcher pid recorded in THIS home's lock.
   lock_pid=$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)
   if fm_pid_alive "$lock_pid"; then
-    if fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$lock_pid" "$FM_HOME"; then
+    # Stop the holder when the lock's own identity vouches for it, OR when the
+    # live pid is demonstrably running this watcher script. The second arm is not
+    # redundant: a lock written by a pre-fix firstmate can be TORN (pid naming one
+    # watcher, pid-identity fingerprinting another), and without it restart would
+    # take the clear-the-lock branch below and yank the lock out from under a live
+    # watcher WITHOUT stopping it - turning a misread into a real outage, exactly
+    # as in docs/incidents/2026-07-12-torn-watcher-lock.md. Clearing the lock is
+    # reserved for a holder that is genuinely NOT our watcher (a reused pid).
+    if fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$lock_pid" "$FM_HOME" \
+      || fm_pid_runs_command "$lock_pid" "$WATCH"; then
       kill -TERM "$lock_pid" 2>/dev/null || true
       # Wait for it to actually exit before relaunching, so the fresh watcher
       # either takes a released lock or reclaims a now-dead-pid stale lock instead

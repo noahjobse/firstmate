@@ -50,6 +50,16 @@ fm_path_age() {
   echo $(( $(date +%s) - m ))
 }
 
+fm_pid_runs_command() {
+  local pid=$1 command=$2 identity
+  [ -n "$command" ] || return 1
+  identity=$(fm_pid_identity "$pid") || return 1
+  case "$identity" in
+    *"$command"*) return 0 ;;
+  esac
+  return 1
+}
+
 fm_watcher_lock_matches_pid() {
   local state=$1 watch_path=$2 pid=$3 home=${4:-$FM_HOME} lockdir lock_home lock_path lock_identity current_identity
   lockdir="$state/.watch.lock"
@@ -178,8 +188,24 @@ fm_lock_claim() {
   return 0
 }
 
+# A lock must never be visible in a half-written state. Any identity metadata a
+# holder wants the lock to carry (fm-home, watcher-path, pid-identity) is staged
+# into the owner dir by this hook BEFORE the lock symlink publishes it, so the
+# lock a reader sees is always complete and self-consistent. The alternative -
+# claiming the lock and then writing metadata through the lock path - is what
+# produced the torn locks in docs/incidents/2026-07-12-torn-watcher-lock.md: a
+# late write lands in whichever owner dir the symlink names at that instant,
+# which may be a different holder's, leaving a lock whose pid names one process
+# and whose pid-identity fingerprints another. Holders must therefore write lock
+# metadata ONLY through a stage function, never through the lock path.
+fm_lock_stage_owner_meta() {
+  local ownerdir=$1 stage_fn=${2:-}
+  [ -n "$stage_fn" ] || return 0
+  "$stage_fn" "$ownerdir"
+}
+
 fm_lock_try_create() {
-  local lockdir=$1 allowed_steal_owner=${2:-} ownerdir
+  local lockdir=$1 allowed_steal_owner=${2:-} stage_fn=${3:-} ownerdir
   FM_LOCK_OWNER_DIR=
   ownerdir=$(fm_lock_owner_dir "$lockdir") || return 1
   if [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
@@ -187,6 +213,10 @@ fm_lock_try_create() {
     return 1
   fi
   if ! fm_lock_prepare_owner "$ownerdir"; then
+    fm_lock_discard_owner "$ownerdir"
+    return 1
+  fi
+  if ! fm_lock_stage_owner_meta "$ownerdir" "$stage_fn"; then
     fm_lock_discard_owner "$ownerdir"
     return 1
   fi
@@ -248,12 +278,17 @@ fm_lock_recheck_stale_owner() {
   return 0
 }
 
+# fm_lock_try_acquire <lockdir> [<stage_fn>]
+# stage_fn, when given, stages this holder's identity metadata into the owner dir
+# before the lock is published (see fm_lock_stage_owner_meta). It is deliberately
+# NOT passed to the internal steal mutex below: that is a different lock with no
+# identity of its own.
 fm_lock_try_acquire() {
-  local lockdir=$1 pid steal cur rc steal_owner primary_owner
+  local lockdir=$1 stage_fn=${2:-} pid steal cur rc steal_owner primary_owner
   FM_LOCK_HELD_PID=
   FM_LOCK_OWNER_DIR=
 
-  if fm_lock_try_create "$lockdir"; then
+  if fm_lock_try_create "$lockdir" '' "$stage_fn"; then
     return 0
   fi
 
@@ -309,7 +344,7 @@ fm_lock_try_acquire() {
 
   fm_lock_remove_path "$lockdir" || true
   rc=1
-  if fm_lock_try_create "$lockdir" "$steal_owner"; then
+  if fm_lock_try_create "$lockdir" "$steal_owner" "$stage_fn"; then
     rc=0
   fi
   if [ "$rc" -ne 0 ]; then

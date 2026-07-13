@@ -1235,6 +1235,16 @@ trim_log() {
   tail -n "${FM_LOG_KEEP_LINES:-$LOG_KEEP_LINES_DEFAULT}" "$LOG" >"$tmp" 2>/dev/null && mv -f "$tmp" "$LOG"
 }
 
+# Stage hook for the daemon's singleton lock: fm_lock_try_acquire calls this with
+# the owner dir before publishing the lock, so the lock is never observable with a
+# pid but no identity. Runs in the acquiring shell, so ${BASHPID:-$$} is the pid
+# the lock records.
+stage_daemon_lock_meta() {
+  local ownerdir=$1
+  fm_pid_identity "${BASHPID:-$$}" > "$ownerdir/pid-identity" 2>/dev/null || return 1
+  [ -s "$ownerdir/pid-identity" ]
+}
+
 # ============================================================================
 # Everything below runs only when the script is EXECUTED, not sourced. The pure
 # classifiers above are sourceable for unit tests (tests/fm-daemon.test.sh).
@@ -1264,7 +1274,9 @@ fm_super_main() {
   [ -x "$WATCH" ] || { echo "error: watcher not found or not executable: $WATCH" >&2; exit 1; }
 
   # --- single instance (portable lock, no flock dependency) ------------------
-  if ! fm_lock_try_acquire "$LOCK"; then
+  # Identity is staged into the owner dir before the lock publishes, never written
+  # through the lock path afterwards; see fm_lock_stage_owner_meta.
+  if ! fm_lock_try_acquire "$LOCK" stage_daemon_lock_meta; then
     if [ -n "${FM_LOCK_HELD_PID:-}" ]; then
       echo "error: another fm-supervise-daemon is already running (pid $FM_LOCK_HELD_PID, lock $LOCK held)" >&2
     else
@@ -1273,7 +1285,6 @@ fm_super_main() {
     exit 1
   fi
   echo "$$" > "$PIDFILE"
-  fm_pid_identity "${BASHPID:-$$}" > "$LOCK/pid-identity" 2>/dev/null || true
 
   # --- auto-discover the supervisor BACKEND (tmux vs herdr) first -----------
   # Priority: FM_SUPERVISOR_BACKEND override > $TMUX_PANE (tmux) > $HERDR_ENV=1

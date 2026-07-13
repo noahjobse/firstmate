@@ -581,7 +581,22 @@ if [ "${BASH_SOURCE[0]}" != "$0" ]; then
   return 0
 fi
 
-if ! fm_lock_try_acquire "$WATCH_LOCK"; then
+# Stage this watcher's identity into the owner dir BEFORE the lock is published,
+# so no consumer can ever read a lock that names a live pid but carries no (or
+# another watcher's) identity. Writing this metadata through $WATCH_LOCK after
+# the claim is what tore locks apart and made every guard, arm, and turn-end
+# check misreport a live watcher as absent - see
+# docs/incidents/2026-07-12-torn-watcher-lock.md. Runs in this same main shell,
+# so ${BASHPID:-$$} is the pid fm_lock_prepare_owner records.
+stage_watch_lock_meta() {
+  local ownerdir=$1
+  printf '%s\n' "$FM_HOME" > "$ownerdir/fm-home" || return 1
+  printf '%s\n' "$WATCH_PATH" > "$ownerdir/watcher-path" || return 1
+  fm_pid_identity "${BASHPID:-$$}" > "$ownerdir/pid-identity" 2>/dev/null || return 1
+  [ -s "$ownerdir/pid-identity" ]
+}
+
+if ! fm_lock_try_acquire "$WATCH_LOCK" stage_watch_lock_meta; then
   BEAT="$STATE/.last-watcher-beat"
   if [ -n "${FM_LOCK_HELD_PID:-}" ]; then
     if [ -e "$BEAT" ]; then
@@ -605,9 +620,6 @@ trap 'fm_lock_release "$WATCH_LOCK"' EXIT
 # ${BASHPID:-$$} from this same main shell). Read directly, never via a command
 # substitution, so it matches the stored holder pid for the self-eviction check.
 WATCHER_PID=${BASHPID:-$$}
-printf '%s\n' "$FM_HOME" > "$WATCH_LOCK/fm-home" || true
-printf '%s\n' "$WATCH_PATH" > "$WATCH_LOCK/watcher-path" || true
-fm_pid_identity "$WATCHER_PID" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
 
 [ -e "$STATE/.last-heartbeat" ] || touch "$STATE/.last-heartbeat"
 

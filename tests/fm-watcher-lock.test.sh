@@ -703,8 +703,132 @@ test_pid_identity_is_locale_invariant() {
   pass "fm_pid_identity is locale-invariant across LC_ALL/LC_TIME"
 }
 
+test_lock_metadata_is_staged_before_the_lock_is_published() {
+  # The lock must never be observable in a half-written state. A holder stages its
+  # identity into the OWNER DIR, and only then does the symlink publish it, so no
+  # reader can see a lock that names a live pid but carries no identity (which
+  # every consumer reads as "no watcher"), and no late write can land in another
+  # holder's owner dir and tear the lock apart. Proven by having the stage hook
+  # look for the lock path at the moment it runs: it must still be ABSENT.
+  local dir state lockdir obs out
+  dir=$(make_case lock-stage-atomic)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  obs="$dir/lock-visible-when-staged"
+  out=$(FM_STATE_OVERRIDE="$state" bash -c '
+    LIB=$1; LOCK=$2; OBS=$3
+    . "$LIB"
+    stage_meta() {
+      local ownerdir=$1
+      if [ -e "$LOCK" ] || [ -L "$LOCK" ]; then
+        printf "visible\n" > "$OBS"
+      else
+        printf "absent\n" > "$OBS"
+      fi
+      printf "staged-fingerprint\n" > "$ownerdir/pid-identity"
+    }
+    fm_lock_try_acquire "$LOCK" stage_meta || exit 7
+    printf "staged_at=%s identity=%s\n" "$(cat "$OBS")" "$(cat "$LOCK/pid-identity" 2>/dev/null)"
+  ' _ "$LIB" "$lockdir" "$obs") || fail "staged acquire failed: $out"
+  case "$out" in
+    *"staged_at=absent"*) ;;
+    *) fail "lock was already published when its metadata was staged: $out" ;;
+  esac
+  case "$out" in
+    *"identity=staged-fingerprint"*) ;;
+    *) fail "published lock does not carry the staged identity: $out" ;;
+  esac
+  pass "lock metadata is staged into the owner dir before the lock is published"
+}
+
+test_watch_lock_names_its_own_watcher_from_a_clean_environment() {
+  # The turn-end guard runs from a harness Stop hook, not the operator's shell, so
+  # the predicate must hold with FM_HOME unset and the environment stripped. A live
+  # watcher must read healthy; a killed one must not. Both directions, one test.
+  local dir state fakebin out pid i probe
+  dir=$(make_case lock-clean-env)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  probe='. "$1"; if fm_watcher_healthy "$2/state" "$3" 300 "$2"; then echo healthy; else echo unhealthy; fi'
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$pid" ] && [ -e "$state/.last-watcher-beat" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$pid" ] || fail "watcher did not take the lock"
+  # env -i: no FM_HOME, no FM_STATE_OVERRIDE, nothing inherited from this shell.
+  [ "$(env -i PATH="$PATH" bash -c "$probe" _ "$LIB" "$dir" "$WATCH")" = healthy ] \
+    || fail "live watcher read as absent from a cleared environment (the Stop-hook case)"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  [ "$(env -i PATH="$PATH" bash -c "$probe" _ "$LIB" "$dir" "$WATCH")" = unhealthy ] \
+    || fail "killed watcher still read as healthy - the guard would go silent with supervision off"
+  pass "watcher lock reads healthy for a live watcher and unhealthy for a killed one with FM_HOME unset"
+}
+
+test_restart_stops_a_live_watcher_behind_a_torn_lock() {
+  # The outage regression. A TORN lock - pid naming a live watcher, pid-identity
+  # fingerprinting some other process - makes fm_watcher_lock_matches_pid fail.
+  # Restart must still recognise the live holder as this home's watcher and STOP
+  # it. It must never take the clear-the-lock branch, which would yank the lock
+  # from a watcher that keeps running: that leaves an orphaned watcher racing a
+  # fresh one over a lock neither owns, which is how a false alarm became a real
+  # supervision outage.
+  local dir state fakebin out armout pid armpid i lock_pid stranger
+  dir=$(make_case restart-torn-lock)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  armout="$dir/arm.out"
+  # A long poll keeps the seed watcher alive well past the restart, so "it exited"
+  # can only mean restart stopped it, never that it self-evicted on its own.
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=30 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$pid" ] && [ -e "$state/.last-watcher-beat" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$pid" ] || fail "seed watcher did not take the lock"
+  # Tear the lock exactly as an interleaved late write did: keep the live pid, but
+  # replace the identity with a stranger's.
+  sleep 300 &
+  stranger=$!
+  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$stranger" > "$state/.watch.lock/pid-identity"
+  kill "$stranger" 2>/dev/null || true
+  wait "$stranger" 2>/dev/null || true
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" --restart > "$armout" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    grep -qE 'watcher: (started|healthy) pid=' "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  ! is_live_non_zombie "$pid" \
+    || fail "restart left the live watcher running behind a torn lock (orphaned watcher = the real outage)"
+  lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  { [ -n "$lock_pid" ] && [ "$lock_pid" != "$pid" ] && kill -0 "$lock_pid" 2>/dev/null; } \
+    || fail "restart did not leave a live watcher holding the lock (got '$lock_pid')"
+  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_watcher_lock_matches_pid "$2/state" "$3" "$4" "$2"' \
+    _ "$LIB" "$dir" "$WATCH" "$lock_pid" \
+    || fail "lock rebuilt by restart is still not self-consistent (pid does not match its own identity)"
+  kill "$armpid" "$lock_pid" 2>/dev/null || true
+  wait "$armpid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  pass "restart stops a live watcher behind a torn lock instead of orphaning it"
+}
+
 test_singleton_start
 test_pid_identity_is_locale_invariant
+test_lock_metadata_is_staged_before_the_lock_is_published
+test_watch_lock_names_its_own_watcher_from_a_clean_environment
+test_restart_stops_a_live_watcher_behind_a_torn_lock
 test_stale_watch_lock_reclaimed
 test_live_stale_watch_lock_is_actionable
 test_guard_warnings
