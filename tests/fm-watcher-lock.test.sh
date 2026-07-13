@@ -978,6 +978,87 @@ test_lock_acquire_fails_closed_on_an_unwritable_state_dir() {
   pass "lock acquire fails closed (rc 2, no holder) on an unwritable state dir instead of recursing"
 }
 
+test_unwritable_state_dir_with_a_live_holder_is_contention() {
+  # The other half of the own-failure contract, and the one that can kill a
+  # watcher. An unwritable (or full) state dir fails OUR writes while an existing
+  # holder's lock sits right there, so a live healthy watcher plus a full disk must
+  # read as contention (rc 1, that holder's pid), NEVER as "we could not build a
+  # lock and nothing is running". Reporting that as an own failure is what makes
+  # the watcher print "supervision is NOT armed", the arm report FAILED, and the
+  # repair path (--restart) stop a perfectly healthy watcher because the disk
+  # filled up.
+  local dir state fakebin out out2 pid i status
+  [ "$(id -u)" -ne 0 ] || { echo "skip: running as root, an unwritable dir is still writable"; return 0; }
+  dir=$(make_case unwritable-state-live-holder)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  out2="$dir/watch2.out"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=30 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$pid" ] && [ -e "$state/.last-watcher-beat" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$pid" ] || fail "seed watcher did not take the lock"
+  chmod 500 "$state"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1/$2 are the probe shell's own positional args
+  out=$(timeout 20 env FM_HOME="$dir" bash -c '
+    . "$1"
+    fm_lock_try_acquire "$2/state/.watch.lock"
+    printf "rc=%s held=%s staged_failed=%s\n" "$?" "${FM_LOCK_HELD_PID:-}" "${FM_LOCK_STAGE_FAILED:-}"
+    fm_watcher_healthy "$2/state" "$3" 300 "$2" && printf "healthy\n"
+  ' _ "$LIB" "$dir" "$WATCH" 2>&1)
+  case "$out" in
+    *"rc=1 held=$pid staged_failed="*) ;;
+    *) fail "a live holder on an unwritable state dir was not reported as contention: $out" ;;
+  esac
+  case "$out" in
+    *healthy*) ;;
+    *) fail "a live watcher on an unwritable state dir stopped reading healthy (the repair path would stop it): $out" ;;
+  esac
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 timeout 20 "$WATCH" > "$out2" 2>&1
+  status=$?
+  chmod 700 "$state"
+  [ "$status" -eq 0 ] || fail "watcher did not stand down for the live holder on an unwritable state dir (status=$status): $(cat "$out2")"
+  grep -qF "watcher: already running pid $pid" "$out2" \
+    || fail "watcher did not report the live holder it lost to: $(cat "$out2")"
+  ! grep -qF 'watcher: FAILED' "$out2" \
+    || fail "a live healthy watcher plus an unwritable state dir was reported as a failure to arm: $(cat "$out2")"
+  is_live_non_zombie "$pid" || fail "the healthy holder did not survive the failed acquire"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  pass "an unwritable state dir with a live holder reports contention, not 'nothing armed'"
+}
+
+test_owner_dir_leaves_nothing_behind_when_a_stage_hook_writes_extra_files() {
+  # A stage hook may stage any filename into its owner dir. If discard only cleared
+  # a fixed name list, an extra file would defeat the rmdir and strand a
+  # <lock>.owner.XXXXXX dir in the state dir on every acquire - and a state dir that
+  # slowly fills is exactly how the contention case above (a full disk with a live
+  # watcher) comes about in the first place.
+  local dir state out strays
+  dir=$(make_case owner-dir-stage-extra)
+  state="$dir/state"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1/$2 are the probe shell's own positional args
+  out=$(timeout 20 env FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    stage_extra() { printf "x\n" > "$1/unknown-metadata"; }
+    stage_fail() { printf "x\n" > "$1/unknown-metadata"; return 1; }
+    fm_lock_try_acquire "$2/.extra.lock" stage_extra || { echo "acquire-failed"; exit 1; }
+    fm_lock_release "$2/.extra.lock"
+    fm_lock_try_acquire "$2/.extra.lock" stage_fail && { echo "staging-failure-not-reported"; exit 1; }
+    echo ok
+  ' _ "$LIB" "$state" 2>&1)
+  [ "$out" = ok ] || fail "stage-hook probe did not behave as expected: $out"
+  [ ! -e "$state/.extra.lock" ] || fail "a released lock (and a failed staging) left a lock behind"
+  strays=$(find "$state" -maxdepth 1 -name '*.owner.*' | wc -l)
+  [ "$strays" -eq 0 ] || fail "$strays owner dir(s) leaked into the state dir after a stage hook wrote an unknown filename"
+  pass "owner dirs are cleared generically, so a stage hook's own filenames leak nothing"
+}
+
 test_watch_fails_loudly_when_the_state_dir_is_unwritable() {
   # Same cause, seen from the watcher: no lock exists and nothing was armed, so it
   # must exit non-zero and say so, never "already running".
@@ -1138,6 +1219,8 @@ test_singleton_start
 test_pid_identity_is_locale_invariant
 test_pid_identity_is_stable_across_reads
 test_lock_acquire_fails_closed_on_an_unwritable_state_dir
+test_unwritable_state_dir_with_a_live_holder_is_contention
+test_owner_dir_leaves_nothing_behind_when_a_stage_hook_writes_extra_files
 test_watch_fails_loudly_when_the_state_dir_is_unwritable
 test_pid_runs_command_matches_only_the_program_being_run
 test_pid_runs_command_matches_a_program_path_containing_spaces

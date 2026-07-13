@@ -298,9 +298,24 @@ fm_lock_points_to_owner() {
   [ "$actual" = "$ownerdir" ]
 }
 
+# An owner dir is this holder's private staging area, and a stage hook may put any
+# filename in it, so its contents are cleared generically rather than by a fixed
+# name list. A leftover file would defeat the rmdir and strand a
+# <lock>.owner.XXXXXX dir in the state dir on every acquire, and a state dir that
+# slowly fills is exactly what turns an ordinary lock failure into a supervision
+# outage. The pattern guard keeps the recursive remove aimed only at dirs
+# fm_lock_owner_dir minted; anything else falls back to the conservative path.
 fm_lock_discard_owner() {
   local ownerdir=$1
   [ -n "$ownerdir" ] || return 0
+  case "${ownerdir##*/}" in
+    *.owner.??????)
+      if [ -d "$ownerdir" ] && [ ! -L "$ownerdir" ]; then
+        rm -rf "$ownerdir" 2>/dev/null || true
+        return 0
+      fi
+      ;;
+  esac
   fm_lock_clean_known_files "$ownerdir"
   rmdir "$ownerdir" 2>/dev/null || true
 }
@@ -374,33 +389,52 @@ fm_lock_stage_owner_meta() {
   "$stage_fn" "$ownerdir"
 }
 
+# The one gate every own-failure path goes through, so rc 2 can only ever mean
+# what it claims: we could not build a lock AND no lock exists. The failures that
+# stop us from building a lock - an unwritable or full state dir - are exactly the
+# ones that leave an existing holder's lock sitting untouched on disk, so a lock
+# that is present makes this contention (rc 1), never our own failure. Reporting a
+# held lock as "nothing is armed" is what lets a caller declare supervision dead
+# and its repair path terminate a live, healthy watcher because the disk is full.
+fm_lock_own_failure_rc() {
+  local lockdir=$1
+  if [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
+    return 1
+  fi
+  # shellcheck disable=SC2034 # Read by callers after the lock helpers return.
+  FM_LOCK_STAGE_FAILED=1
+  return 2
+}
+
 # Returns 0 when the lock is held, 2 when this holder could not build a lock of
 # its own at all (an unwritable or full state dir, mktemp failing, ps unavailable
-# to the stage hook), and 1 for every ordinary loss to another holder. An own
-# failure is OUR problem, not contention, and callers must not report it as
-# "someone else holds the lock": the lock does not exist and nothing is running,
-# so a caller that mistook it for contention would exit quietly and leave
-# supervision unarmed. Every own-failure exit sets FM_LOCK_STAGE_FAILED.
+# to the stage hook) AND no lock exists, and 1 for every ordinary loss to another
+# holder. An own failure is OUR problem, not contention, and callers must not
+# report it as "someone else holds the lock": the lock does not exist and nothing
+# is running, so a caller that mistook it for contention would exit quietly and
+# leave supervision unarmed. The converse matters just as much: an existing lock
+# is checked first, and every own-failure path re-checks through
+# fm_lock_own_failure_rc, so a live holder is never downgraded to rc 2. Every
+# own-failure exit sets FM_LOCK_STAGE_FAILED.
 fm_lock_try_create() {
   local lockdir=$1 allowed_steal_owner=${2:-} stage_fn=${3:-} ownerdir
   FM_LOCK_OWNER_DIR=
-  if ! ownerdir=$(fm_lock_owner_dir "$lockdir") || [ -z "$ownerdir" ]; then
-    FM_LOCK_STAGE_FAILED=1
-    return 2
-  fi
   if [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
-    fm_lock_discard_owner "$ownerdir"
     return 1
+  fi
+  if ! ownerdir=$(fm_lock_owner_dir "$lockdir") || [ -z "$ownerdir" ]; then
+    fm_lock_own_failure_rc "$lockdir"
+    return
   fi
   if ! fm_lock_prepare_owner "$ownerdir"; then
     fm_lock_discard_owner "$ownerdir"
-    FM_LOCK_STAGE_FAILED=1
-    return 2
+    fm_lock_own_failure_rc "$lockdir"
+    return
   fi
   if ! fm_lock_stage_owner_meta "$ownerdir" "$stage_fn"; then
     fm_lock_discard_owner "$ownerdir"
-    FM_LOCK_STAGE_FAILED=1
-    return 2
+    fm_lock_own_failure_rc "$lockdir"
+    return
   fi
   if ln -s "$ownerdir" "$lockdir" 2>/dev/null && fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
     if fm_lock_claim "$lockdir" "$ownerdir" "$allowed_steal_owner"; then
@@ -499,6 +533,16 @@ fm_lock_try_acquire() {
   fm_lock_try_acquire "$steal"
   steal_rc=$?
   if [ "$steal_rc" -eq 2 ]; then
+    # We reached the steal path because the primary lock exists with a dead
+    # holder, and now cannot build the steal mutex either. Before calling that an
+    # own failure, look once more for a live holder: a fresh watcher may have
+    # claimed the lock while we were here, and rc 2 promises nothing is running.
+    cur=$(cat "$lockdir/pid" 2>/dev/null || true)
+    if fm_pid_alive "$cur"; then
+      FM_LOCK_HELD_PID=$cur
+      FM_LOCK_OWNER_DIR=
+      return 1
+    fi
     FM_LOCK_HELD_PID=
     FM_LOCK_OWNER_DIR=
     # shellcheck disable=SC2034 # Read by callers after fm_lock_try_acquire returns.

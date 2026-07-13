@@ -610,12 +610,13 @@ watch_lock_is_absent() {
 # recreating it, so this is ALSO how a benign mid-steal window looks from the
 # loser's side - hence the single retry below before calling it a failure.
 watch_lock_lost_with_nothing_armed() {
-  [ "$lock_rc" -ne 0 ] && [ -z "${FM_LOCK_HELD_PID:-}" ] && watch_lock_is_absent
+  local rc=$1
+  [ "$rc" -ne 0 ] && [ -z "${FM_LOCK_HELD_PID:-}" ] && watch_lock_is_absent
 }
 
 fm_lock_try_acquire "$WATCH_LOCK" stage_watch_lock_meta
 lock_rc=$?
-if [ "$lock_rc" -eq 1 ] && watch_lock_lost_with_nothing_armed; then
+if [ "$lock_rc" -eq 1 ] && watch_lock_lost_with_nothing_armed "$lock_rc"; then
   sleep 0.3
   fm_lock_try_acquire "$WATCH_LOCK" stage_watch_lock_meta
   lock_rc=$?
@@ -629,7 +630,7 @@ if [ "$lock_rc" -eq 2 ]; then
   echo "watcher: FAILED - could not create the watcher lock in $STATE (state dir unwritable or full, or ps unavailable)" >&2
   exit 1
 fi
-if watch_lock_lost_with_nothing_armed; then
+if watch_lock_lost_with_nothing_armed "$lock_rc"; then
   # Still nobody holding supervision and nothing armed after a retry, so this is
   # not the mid-steal window. Never report it as "already running".
   echo "watcher: FAILED - could not acquire the watcher lock in $STATE and no lock is present; supervision is NOT armed" >&2
