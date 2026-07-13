@@ -596,8 +596,25 @@ stage_watch_lock_meta() {
   [ -s "$ownerdir/pid-identity" ]
 }
 
+watch_lock_is_absent() {
+  [ ! -e "$WATCH_LOCK" ] && [ ! -L "$WATCH_LOCK" ]
+}
+
+# True only for a loss that leaves nothing behind: no holder pid was recorded and
+# no lock is on disk. A contender stealing a stale lock removes it before
+# recreating it, so this is ALSO how a benign mid-steal window looks from the
+# loser's side - hence the single retry below before calling it a failure.
+watch_lock_lost_with_nothing_armed() {
+  [ "$lock_rc" -ne 0 ] && [ -z "${FM_LOCK_HELD_PID:-}" ] && watch_lock_is_absent
+}
+
 fm_lock_try_acquire "$WATCH_LOCK" stage_watch_lock_meta
 lock_rc=$?
+if [ "$lock_rc" -eq 1 ] && watch_lock_lost_with_nothing_armed; then
+  sleep 0.3
+  fm_lock_try_acquire "$WATCH_LOCK" stage_watch_lock_meta
+  lock_rc=$?
+fi
 if [ "$lock_rc" -eq 2 ]; then
   # We could not build a lock of our own (unwritable or full state dir, mktemp
   # failing, ps unavailable to the stage hook), so no lock exists and no watcher is
@@ -607,9 +624,9 @@ if [ "$lock_rc" -eq 2 ]; then
   echo "watcher: FAILED - could not create the watcher lock in $STATE (state dir unwritable or full, or ps unavailable)" >&2
   exit 1
 fi
-if [ "$lock_rc" -ne 0 ] && [ ! -e "$WATCH_LOCK" ] && [ ! -L "$WATCH_LOCK" ]; then
-  # Lost the lock, yet no lock exists: nobody is holding supervision and we armed
-  # nothing. Never report this as "already running".
+if watch_lock_lost_with_nothing_armed; then
+  # Still nobody holding supervision and nothing armed after a retry, so this is
+  # not the mid-steal window. Never report it as "already running".
   echo "watcher: FAILED - could not acquire the watcher lock in $STATE and no lock is present; supervision is NOT armed" >&2
   exit 1
 fi

@@ -993,6 +993,88 @@ test_pid_runs_command_matches_only_the_program_being_run() {
   pass "fm_pid_runs_command matches the program being run, not a path in the arguments"
 }
 
+test_pid_runs_command_matches_a_program_path_containing_spaces() {
+  # A home whose path contains a space still runs the same watcher. Word-splitting
+  # the command line truncates such a path, so the arm would read a LIVE watcher as
+  # not running its script, fall through to clearing the lock, and yank it out from
+  # under that watcher - the outage in docs/incidents/2026-07-12-torn-watcher-lock.md.
+  local dir spaced watcher live_pid probe
+  dir=$(make_case pid-runs-command-spaces)
+  spaced="$dir/a home with spaces"
+  watcher="$spaced/fm-watch.sh"
+  mkdir -p "$spaced"
+  cat > "$watcher" <<'SH'
+#!/usr/bin/env bash
+sleep 30
+SH
+  chmod +x "$watcher"
+  probe='. "$1"; if fm_pid_runs_command "$2" "$3"; then echo match; else echo nomatch; fi'
+  "$watcher" &
+  live_pid=$!
+  sleep 0.3
+  [ "$(FM_STATE_OVERRIDE="$dir/state" bash -c "$probe" _ "$LIB" "$live_pid" "$watcher")" = match ] \
+    || fail "a live watcher whose path contains a space did not match its own script path"
+  kill "$live_pid" 2>/dev/null || true
+  wait "$live_pid" 2>/dev/null || true
+  tail -f "$watcher" > /dev/null 2>&1 &
+  live_pid=$!
+  sleep 0.2
+  [ "$(FM_STATE_OVERRIDE="$dir/state" bash -c "$probe" _ "$LIB" "$live_pid" "$watcher")" = nomatch ] \
+    || fail "a process merely reading the spaced watcher path matched as running it"
+  kill "$live_pid" 2>/dev/null || true
+  wait "$live_pid" 2>/dev/null || true
+  pass "fm_pid_runs_command matches a program path containing spaces, still not one named in arguments"
+}
+
+test_wake_append_fails_fast_when_the_state_dir_is_unwritable() {
+  # The queue lock cannot be created at all on an unwritable (or full) state dir.
+  # That is permanent, not contention, so waiting on it would block forever and no
+  # wake would ever be queued or surfaced - a silent total supervision failure. It
+  # must fail promptly and loudly instead.
+  local dir state out rc
+  [ "$(id -u)" -ne 0 ] || { echo "skip: running as root, an unwritable dir is still writable"; return 0; }
+  dir=$(make_case wake-append-unwritable-state)
+  state="$dir/state"
+  chmod 500 "$state"
+  out=$(timeout 15 env FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_wake_append signal fm-x "signal: fm-x"
+    printf "rc=%s\n" "$?"
+  ' _ "$LIB" 2>&1)
+  rc=$?
+  chmod 700 "$state"
+  [ "$rc" -ne 124 ] || fail "fm_wake_append hung on an unwritable state dir instead of failing: $out"
+  [ "$rc" -eq 0 ] || fail "the wake-append probe did not terminate cleanly (rc=$rc): $out"
+  case "$out" in
+    *"rc=0"*) fail "fm_wake_append reported success though no wake could be queued: $out" ;;
+  esac
+  case "$out" in
+    *"NOT queued"*) ;;
+    *) fail "fm_wake_append did not report the failure loudly: $out" ;;
+  esac
+  pass "fm_wake_append fails loudly and promptly when the state dir is unwritable"
+}
+
+test_wake_drain_fails_loudly_when_the_state_dir_is_unwritable() {
+  # Same cause, seen from the drain: it must not block forever at the top of a
+  # wake-handling turn.
+  local dir state out status
+  [ "$(id -u)" -ne 0 ] || { echo "skip: running as root, an unwritable dir is still writable"; return 0; }
+  dir=$(make_case wake-drain-unwritable-state)
+  state="$dir/state"
+  chmod 500 "$state"
+  out=$(FM_STATE_OVERRIDE="$state" timeout 15 "$DRAIN" 2>&1)
+  status=$?
+  chmod 700 "$state"
+  [ "$status" -ne 124 ] || fail "fm-wake-drain hung on an unwritable state dir: $out"
+  [ "$status" -ne 0 ] || fail "fm-wake-drain exited zero though it could not lock the queue: $out"
+  case "$out" in
+    *FAILED*) ;;
+    *) fail "fm-wake-drain did not report the failure loudly: $out" ;;
+  esac
+  pass "fm-wake-drain fails loudly when an unwritable state dir prevents locking the queue"
+}
+
 test_pid_home_matches_separates_state_override_domains() {
   # Two domains can share a home root and differ only by FM_STATE_OVERRIDE, each
   # with its own .watch.lock. They are different supervision domains and must not
@@ -1022,6 +1104,9 @@ test_pid_identity_is_locale_invariant
 test_lock_acquire_fails_closed_on_an_unwritable_state_dir
 test_watch_fails_loudly_when_the_state_dir_is_unwritable
 test_pid_runs_command_matches_only_the_program_being_run
+test_pid_runs_command_matches_a_program_path_containing_spaces
+test_wake_append_fails_fast_when_the_state_dir_is_unwritable
+test_wake_drain_fails_loudly_when_the_state_dir_is_unwritable
 test_pid_home_matches_separates_state_override_domains
 test_lock_metadata_is_staged_before_the_lock_is_published
 test_restart_never_kills_a_sibling_homes_watcher

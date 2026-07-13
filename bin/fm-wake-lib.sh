@@ -57,24 +57,54 @@ fm_pid_is_interpreter_word() {
   return 1
 }
 
+# True when the command line's leading program IS <command>: either the whole line
+# or the line up to the first argument. Compared as a prefix of the untokenised
+# line, so a program path containing spaces still matches - word-splitting the
+# line would truncate such a path and silently report a live watcher as not
+# running its own script.
+fm_cmdline_leading_program_is() {
+  local cmdline=$1 command=$2
+  [ "$cmdline" = "$command" ] && return 0
+  case "$cmdline" in
+    "$command "*) return 0 ;;
+  esac
+  return 1
+}
+
+fm_cmdline_drop_leading_word() {
+  local cmdline=$1 word
+  word=${cmdline%%[[:space:]]*}
+  cmdline=${cmdline#"$word"}
+  while [ "$cmdline" != "${cmdline#[[:space:]]}" ]; do
+    cmdline=${cmdline#[[:space:]]}
+  done
+  printf '%s' "$cmdline"
+}
+
 # True when <pid> is EXECUTING <command>, i.e. the path is the program being run
 # (argv[0], or the script argument of an interpreter, since a shebang script runs
 # as `bash /path/script`). A free substring match over the command line would also
 # accept a process that merely NAMES the path in its arguments (an editor, a grep,
 # a tail), and callers signal what this vouches for - so the match is anchored to
-# the command word, never the arguments.
+# the leading program, never the arguments.
 fm_pid_runs_command() {
-  local pid=$1 command=$2 cmdline argv0 argv1 argv2
+  local pid=$1 command=$2 cmdline word depth=0
   [ -n "$command" ] || return 1
   cmdline=$(LC_ALL=C ps -p "$pid" -o command= 2>/dev/null) || return 1
   [ -n "$cmdline" ] || return 1
-  read -r argv0 argv1 argv2 _ <<<"$cmdline"
-  [ "$argv0" = "$command" ] && return 0
-  fm_pid_is_interpreter_word "${argv0:-}" || return 1
-  [ "${argv1:-}" = "$command" ] && return 0
-  # `#!/usr/bin/env bash` runs as `env bash /path/script` on some systems.
-  fm_pid_is_interpreter_word "${argv1:-}" || return 1
-  [ "${argv2:-}" = "$command" ]
+  # Peel at most two interpreter words: a shebang script runs as `bash /path`, and
+  # `#!/usr/bin/env bash` runs as `env bash /path` on some systems. Anything else
+  # leading the line (grep, tail, an editor) is not executing the script.
+  while :; do
+    fm_cmdline_leading_program_is "$cmdline" "$command" && return 0
+    [ "$depth" -lt 2 ] || return 1
+    word=${cmdline%%[[:space:]]*}
+    [ -n "$word" ] || return 1
+    fm_pid_is_interpreter_word "$word" || return 1
+    cmdline=$(fm_cmdline_drop_leading_word "$cmdline")
+    [ -n "$cmdline" ] || return 1
+    depth=$((depth + 1))
+  done
 }
 
 # Read one variable out of another process's OWN environment. Linux-only: where
@@ -499,9 +529,21 @@ fm_lock_try_acquire() {
   return "$rc"
 }
 
+# Waits out contention (rc 1: another holder, which always ends), but never an own
+# failure (rc 2: we cannot build a lock at all). That condition is permanent, so
+# retrying it would spin forever - and a caller blocked here queues nothing and
+# surfaces nothing, which is a silent total supervision failure. Returns 2, with
+# FM_LOCK_STAGE_FAILED set, so the caller can fail loudly instead.
 fm_lock_acquire_wait() {
-  local lockdir=$1
-  while ! fm_lock_try_acquire "$lockdir"; do
+  local lockdir=$1 rc
+  while :; do
+    fm_lock_try_acquire "$lockdir"
+    rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    if [ "$rc" -eq 2 ]; then
+      printf 'fm_lock_acquire_wait: cannot create the lock %s (state dir unwritable or full, or ps unavailable)\n' "$lockdir" >&2
+      return 2
+    fi
     sleep 0.1
   done
 }
@@ -542,7 +584,10 @@ fm_wake_append() {
   seq_file="$STATE/.wake-queue.seq"
   status=0
 
-  fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+  if ! fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"; then
+    printf 'fm_wake_append: could not lock the wake queue in %s; the %s wake was NOT queued\n' "$STATE" "$kind" >&2
+    return 1
+  fi
   seq=$(cat "$seq_file" 2>/dev/null || echo 0)
   case "$seq" in
     ''|*[!0-9]*) seq=0 ;;
