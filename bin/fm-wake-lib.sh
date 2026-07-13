@@ -194,6 +194,18 @@ fm_path_canonical_file() {
   printf '%s/%s\n' "$dir" "$base"
 }
 
+# The same normalisation, but only for a path we can resolve against the
+# filesystem: a RELATIVE path in another process's argv was resolved against ITS
+# cwd, not ours, so canonicalising it here would invent a path that process never
+# ran. Such a path is passed through untouched and can then only match literally.
+fm_path_canonical_file_if_absolute() {
+  local path=$1
+  case "$path" in
+    /*) fm_path_canonical_file "$path" || printf '%s\n' "$path" ;;
+    *) printf '%s\n' "$path" ;;
+  esac
+}
+
 fm_path_mtime() {
   if [ "$(uname)" = Darwin ]; then
     stat -f %m "$1" 2>/dev/null
@@ -216,17 +228,29 @@ fm_pid_is_interpreter_word() {
 }
 
 # True when the command line's leading program IS <command>: either the whole line
-# or the line up to the first argument. Compared as a prefix of the untokenised
-# line, so a program path containing spaces still matches - word-splitting the
-# line would truncate such a path and silently report a live watcher as not
-# running its own script.
+# or the line up to the first argument. Compared first as a prefix of the
+# untokenised line, so a program path containing spaces still matches -
+# word-splitting the line would truncate such a path and silently report a live
+# watcher as not running its own script.
+# When that literal compare fails, both sides are canonicalised and compared
+# again, for the same reason the lock's recorded watcher-path is: one script
+# reached through a symlinked bin dir, or through a logical rather than physical
+# pwd, is spelled two ways, and a byte compare then reads a live supervisor as a
+# stranger - which costs a refusal (a restart that will not stop its own watcher,
+# an /afk that will not resolve its own daemon's lock), not a false kill.
 fm_cmdline_leading_program_is() {
-  local cmdline=$1 command=$2
+  local cmdline=$1 command=$2 word
   [ "$cmdline" = "$command" ] && return 0
   case "$cmdline" in
     "$command "*) return 0 ;;
   esac
-  return 1
+  word=${cmdline%%[[:space:]]*}
+  case "$word" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  [ "$(fm_path_canonical_file_if_absolute "$word")" \
+    = "$(fm_path_canonical_file_if_absolute "$command")" ]
 }
 
 fm_cmdline_drop_leading_word() {
@@ -398,17 +422,13 @@ fm_lock_clean_known_files() {
     2>/dev/null || true
 }
 
-fm_lock_abs_path() {
-  local path=$1 dir base
-  dir=$(dirname "$path")
-  base=$(basename "$path")
-  dir=$(cd "$dir" 2>/dev/null && pwd -P) || return 1
-  printf '%s/%s\n' "$dir" "$base"
-}
-
+# The owner dir is minted beside the lock, addressed by the lock's canonical path
+# so the symlink published at the lock records one stable spelling of it. A state
+# dir that cannot be resolved leaves the literal path, and mktemp then fails on it,
+# which fm_lock_try_create already reports as an own failure.
 fm_lock_owner_dir() {
   local lockdir=$1 lock_abs
-  lock_abs=$(fm_lock_abs_path "$lockdir") || return 1
+  lock_abs=$(fm_path_canonical_file "$lockdir") || return 1
   mktemp -d "${lock_abs}.owner.XXXXXX" 2>/dev/null
 }
 
@@ -480,20 +500,21 @@ fm_lock_claim() {
   local lockdir=$1 ownerdir=$2 allowed_steal_owner=${3:-} mypid back
   mypid=${BASHPID:-$$}
   back=$(cat "$ownerdir/pid" 2>/dev/null || true)
-  # On the try_create path the owner dir is already published behind the lock
-  # symlink and fm_lock_prepare_owner already recorded this pid. Rewriting it
-  # would truncate a file readers reach through the lock, and a reader landing in
-  # that window would see an empty pid - which every consumer reads as "no live
-  # holder". Holders never write into a published owner dir; only a late claimant
-  # of an owner dir it prepared itself (and has not published) writes here.
+  # The owner dir is published behind the lock symlink by the time we claim it, and
+  # fm_lock_prepare_owner recorded this pid into it before publication. So this is
+  # an assertion, never a write: writing here would truncate a file readers reach
+  # through the lock, and a reader landing in that window would see an empty pid,
+  # which every consumer reads as "no live holder". Holders never write into a
+  # published owner dir; lock metadata is staged before publication only
+  # (fm_lock_stage_owner_meta).
+  # An owner dir we abandon must not stay published, or the lock left behind names
+  # a directory that no longer exists and no contender can ever create the lock
+  # again. Only a link to THIS owner dir that vouches for no live holder is
+  # unlinked; another holder's lock is left untouched.
   if [ "$back" != "$mypid" ]; then
-    if ! { printf '%s\n' "$mypid" > "$ownerdir/pid"; } 2>/dev/null; then
-      fm_lock_discard_owner "$ownerdir"
-      return 1
+    if ! fm_pid_alive "$back" && fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
+      rm -f "$lockdir" 2>/dev/null || true
     fi
-    back=$(cat "$ownerdir/pid" 2>/dev/null || true)
-  fi
-  if [ "$back" != "$mypid" ]; then
     fm_lock_discard_owner "$ownerdir"
     return 1
   fi

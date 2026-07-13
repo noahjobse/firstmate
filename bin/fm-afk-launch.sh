@@ -93,31 +93,48 @@ fm_afk_launch_refuse_ambiguous_lock() {  # <refused-action>
 fm_afk_launch_lock_state() {
   local pid expected rc=0
   [ -d "$FM_AFK_LAUNCH_LOCK" ] || return 1
-  pid=$(cat "$FM_AFK_LAUNCH_LOCK/pid" 2>/dev/null) || return 1
-  expected=$(cat "$FM_AFK_LAUNCH_LOCK/pid-identity" 2>/dev/null) || return 1
+  pid=$(cat "$FM_AFK_LAUNCH_LOCK/pid" 2>/dev/null || true)
+  [ -n "$pid" ] || return 1
+  fm_pid_alive "$pid" || return 1
+  expected=$(cat "$FM_AFK_LAUNCH_LOCK/pid-identity" 2>/dev/null || true)
+  # A LIVE holder with no readable identity is ambiguous, never reclaimable. Today's
+  # launcher stages its fingerprint before the lock publishes, so it cannot produce
+  # this lock; a lock left by an older launcher can, and reading it as unowned would
+  # evict a live launcher and run two at once.
+  [ -n "$expected" ] || return 2
   fm_pid_matches_identity "$pid" "$expected" || rc=$?
   return "$rc"
 }
 
+# Stage hook for the launcher lock: fm_lock_try_create calls this with the owner
+# dir BEFORE the lock symlink publishes it, so the lock a contender reads always
+# carries both a pid and its identity. Publishing the lock first and writing the
+# identity through it afterwards is the torn-lock shape of
+# docs/incidents/2026-07-12-torn-watcher-lock.md: a contender that lands in that
+# window reads an identity-less lock and, once its patience for an incomplete lock
+# runs out, evicts a live launcher.
+fm_afk_launch_stage_lock_meta() {
+  local ownerdir=$1
+  fm_pid_identity "${BASHPID:-$$}" > "$ownerdir/pid-identity" 2>/dev/null || return 1
+  [ -s "$ownerdir/pid-identity" ]
+}
+
 fm_afk_launch_lock_acquire() {
-  local i incomplete=0 identity pid lock_state
+  local i incomplete=0 pid lock_state create_rc
   mkdir -p "$FM_AFK_LAUNCH_STATE" || return 1
   for i in $(seq 1 200); do
-    if mkdir "$FM_AFK_LAUNCH_LOCK" 2>/dev/null; then
-      if ! printf '%s' "$$" > "$FM_AFK_LAUNCH_LOCK/pid"; then
-        rm -rf "$FM_AFK_LAUNCH_LOCK"
-        return 1
-      fi
-      identity=$(fm_pid_identity "$$" 2>/dev/null) || {
-        rm -rf "$FM_AFK_LAUNCH_LOCK"
-        return 1
-      }
-      if [ -z "$identity" ] || ! printf '%s' "$identity" > "$FM_AFK_LAUNCH_LOCK/pid-identity"; then
-        rm -rf "$FM_AFK_LAUNCH_LOCK"
-        return 1
-      fi
+    create_rc=0
+    fm_lock_try_create "$FM_AFK_LAUNCH_LOCK" '' fm_afk_launch_stage_lock_meta || create_rc=$?
+    if [ "$create_rc" -eq 0 ]; then
       return 0
     fi
+    if [ "$create_rc" -eq 2 ]; then
+      fm_afk_launch_log "cannot create the launcher lock $FM_AFK_LAUNCH_LOCK (state dir unwritable or full, or ps unavailable)"
+      return 1
+    fi
+    # Only a lock published by an older launcher can be observed half-written; wait
+    # it out rather than judging it, and never let that patience expire into an
+    # eviction - an incomplete lock with a live holder reads as ambiguous below.
     if [ ! -s "$FM_AFK_LAUNCH_LOCK/pid" ] || [ ! -s "$FM_AFK_LAUNCH_LOCK/pid-identity" ]; then
       incomplete=$((incomplete + 1))
       if [ "$incomplete" -lt 20 ]; then
@@ -135,7 +152,7 @@ fm_afk_launch_lock_acquire() {
       return 1
     fi
     if [ "$lock_state" -ne 0 ]; then
-      rm -rf "$FM_AFK_LAUNCH_LOCK" 2>/dev/null || return 1
+      fm_lock_remove_path "$FM_AFK_LAUNCH_LOCK" 2>/dev/null || return 1
       incomplete=0
       continue
     fi
@@ -148,8 +165,8 @@ fm_afk_launch_lock_acquire() {
 fm_afk_launch_lock_release() {
   local pid
   pid=$(cat "$FM_AFK_LAUNCH_LOCK/pid" 2>/dev/null || true)
-  [ "$pid" = "$$" ] || return 0
-  rm -rf "$FM_AFK_LAUNCH_LOCK"
+  [ "$pid" = "${BASHPID:-$$}" ] || return 0
+  fm_lock_remove_path "$FM_AFK_LAUNCH_LOCK" 2>/dev/null || true
 }
 
 fm_afk_launch_usage() {
