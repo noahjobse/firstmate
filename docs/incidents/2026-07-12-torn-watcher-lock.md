@@ -136,3 +136,48 @@ Torn locks can no longer form now that identity publishes atomically, so this af
 - `test_owner_dir_leaves_nothing_behind_when_a_stage_hook_writes_extra_files` - owner dirs are cleared generically on discard, so a stage hook writing any filename cannot strand `<lock>.owner.XXXXXX` dirs in the state dir - a slow path to the very full-state-dir condition above.
 
 The two restart-behavior tests skip on a platform without `/proc`, where the arm deliberately refuses to signal an unattributable holder and so has nothing to assert.
+
+## Follow-on, 2026-07-13 - the `pgrep -f` miscount that reverted this fix
+
+The day after this fix landed, supervision was reported as degraded on the primary: three watchers alive at once, an absent lock, and a silent turn-end guard, read together as a dangerous false negative.
+The fix was merged and then reverted on that evidence.
+Every part of the reading was an instrumentation artifact, and the fix was not at fault.
+
+A watcher was counted with a command-line match:
+
+```
+$ pgrep -af 'bin/fm-watch.sh'
+26311 claude --dangerously-skip-permissions You are a crewmate: ... `pgrep -af 'bin/fm-watch.sh'` ...
+64500 bash /home/noah/projects/firstmate/bin/fm-watch.sh
+```
+
+A crewmate's command line contains its entire brief, and this crewmate's brief was about the watcher, so it quoted `bin/fm-watch.sh` and matched itself.
+The trap is self-referential: any brief describing the watcher makes the agent reading it look like one.
+Reading `comm` instead of the full command line separates them, and only one watcher was ever running:
+
+```
+$ ps -o comm= -p 26311
+claude
+$ ps -o comm= -p 64500
+bash
+```
+
+The guard's silence was a second artifact, of probing it by hand.
+`bin/fm-turnend-guard.sh` reads the Stop-hook JSON payload from stdin and exits 0 when it is empty, before it evaluates supervision at all, so running it from a terminal reports nothing regardless of state.
+Against one identical state - one task in flight, no lock, no watcher, so supervision genuinely dead - the two invocations disagree:
+
+```
+$ bin/fm-turnend-guard.sh </dev/null ; echo "exit=$?"
+exit=0
+$ printf '{"stop_hook_active":false}' | bin/fm-turnend-guard.sh ; echo "exit=$?"
+●  TURN WOULD END BLIND - SUPERVISION IS OFF
+●  1 task(s) in flight, but no live watcher holds this home lock (last beat: 0s ago).
+exit=2
+```
+
+Running the guard by hand is not a health probe, and its silence is never evidence that supervision is live.
+`fm_watcher_healthy` is fail-closed on an absent lock by construction: it reads `state/.watch.lock/pid`, and an empty pid cannot be alive, so it returns unhealthy.
+Both directions were verified against the deployed tree and this branch - a healthy watcher stays silent, and an absent lock, a lock with no pid file, a dead pid, and a stale beacon each fire the banner.
+
+The lasting lesson is about the instrument, not the lock.
+`AGENTS.md` section 8 already forbade `pkill -f bin/fm-watch.sh` because that pattern is unsafe for *killing* across homes; it now also forbids `pgrep -f` for *counting*, because the same pattern is unsafe for identification, and names the lock-plus-`comm` check that replaces it.
