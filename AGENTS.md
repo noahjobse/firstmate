@@ -560,6 +560,7 @@ After handling drained wakes, resume the emitted harness protocol before ending 
 Never use shell `&` as a substitute for a verified harness wake mechanism.
 If the active protocol's arm wrapper reports or attaches to an existing healthy watcher, do not start another cycle; attached arms stay live until that cycle ends.
 If it reports failure, drain queued wakes first and then repair supervision according to the emitted block.
+A supervision command that reports it could not create its own lock (an unwritable or full state dir) exits non-zero and is a real blocker, never contention: nothing is armed, the queue was not drained, and the state dir must be fixed before treating supervision as live.
 **No turn ends blind, holds included.**
 Never end a turn while any task is in flight without the active harness supervision protocol live: a text-only "holding" or "waiting" reply with crewmates live and no live cycle is a bug, and because such a turn runs no supervision script it is exactly the blind gap the script-only guard (`fm-guard.sh`, below) cannot catch, so this discipline must.
 If a forced restart is ever genuinely needed, use `bin/fm-watch-arm.sh --restart`, which signals only this home's recorded watcher and then owns a fresh cycle or reports restart-only `healthy` without attaching if a healthy peer still holds the lock.

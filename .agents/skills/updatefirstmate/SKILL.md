@@ -58,3 +58,6 @@ This touches only the firstmate repo and its own worktrees, never anything under
 - **Secondmates are never disrupted.**
   A secondmate gets a tracked-files fast-forward (safe while it is mid-task, since its work lives in gitignored operational dirs and separate project worktrees) plus a gentle re-read nudge.
   It is never torn down, interrupted, or forced.
+- **One accepted post-update bark.**
+  An update that crosses the watcher-lock identity change (`docs/incidents/2026-07-12-torn-watcher-lock.md`) leaves a still-running pre-update watcher fingerprinted in the old format, so a home reads as having no live watcher until one `bin/fm-watch-arm.sh --restart` cycle replaces it.
+  That is expected once per updated home, not a real supervision outage; repair it through the emitted harness protocol rather than a broad `pkill`.

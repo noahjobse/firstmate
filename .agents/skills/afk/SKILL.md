@@ -191,7 +191,11 @@ the marker lets firstmate distinguish it from a real captain message.
 - **Marker strip** - `strip_injection_marker` removes the sentinel prefix before
   classification or relay, so the digest text firstmate sees is clean.
 - **Portable singleton lock** - the daemon uses the repo's portable lock helper
-  (`fm-wake-lib.sh`) instead of `flock`, which is absent on macOS.
+  (`fm-wake-lib.sh`) instead of `flock`, which is absent on macOS. Its identity is
+  staged into the lock before the lock publishes, so the lock is never observable
+  half-written, and a failure to build the lock at all (an unwritable or full state
+  dir) is reported as the daemon's own error rather than as another daemon already
+  running.
 - **Dedupe across signal/stale/scan** - `classify_signal` and `classify_stale`
   both check the seen-status marker before escalating, so a status escalated by
   one path is not re-escalated by another in the same digest.
