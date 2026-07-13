@@ -6,10 +6,13 @@
 #   Sets state/.afk unless FM_AFK_STATE_PREPARED=1, checks
 #   state/.supervise-daemon.lock, and:
 #     - prints "afk: daemon already running pid=<pid>" then exits 0 when that
-#       lock is held by a live daemon (a REFRESH: no stale-artifact clear);
+#       lock is held by a live daemon (a REFRESH: no stale-artifact clear), whether
+#       its recorded identity vouches for it or it is instead positively attributed
+#       to this home's daemon script and environment;
 #     - exits NON-ZERO, naming the lock to remove, when the lock is held by a live
-#       pid whose recorded identity this version cannot read: never evict it,
-#       never start a second daemon beside it, and never stand down silently;
+#       pid whose recorded identity this version cannot read and which cannot be
+#       attributed to this home either: never evict it, never start a second daemon
+#       beside it, and never stand down silently;
 #     - otherwise clears any prior away session's stale escalation artifacts
 #       (fm_afk_clear_stale_artifacts) for a direct, non-prepared start, then
 #       execs bin/fm-supervise-daemon.sh in the foreground. A prepared start was
@@ -46,7 +49,7 @@ FM_AFK_DAEMON="$FM_AFK_START_DIR/fm-supervise-daemon.sh"
 . "$FM_AFK_START_DIR/fm-wake-lib.sh"
 
 fm_afk_start_usage() {
-  sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # fm_afk_clear_stale_artifacts: on a FRESH away-session entry (the daemon is not
@@ -107,10 +110,22 @@ daemon_pid_matches() {
     fm_pid_matches_identity "$pid" "$identity" || rc=$?
     return "$rc"
   fi
+  daemon_pid_attributed "$pid" && return 0
   fm_pid_runs_command "$pid" "$FM_AFK_DAEMON" || return 1
   fm_pid_home_readable "$pid" || return 2
-  fm_pid_home_matches "$pid" "$FM_HOME" "$FM_AFK_STATE" || return 1
-  return 0
+  return 1
+}
+
+# Positively attribute a live pid to THIS home's daemon WITHOUT reading its
+# recorded fingerprint: it must be EXECUTING this home's daemon script, and its own
+# environment must resolve to this home and state dir. This is the same attribution
+# bin/fm-watch-arm.sh requires before it signals a watcher, and it is independent of
+# the identity format, so it still holds across the in-place update that changed it.
+daemon_pid_attributed() {  # <pid>
+  local pid=$1
+  [ -n "$pid" ] || return 1
+  fm_pid_runs_command "$pid" "$FM_AFK_DAEMON" || return 1
+  fm_pid_home_matches "$pid" "$FM_HOME" "$FM_AFK_STATE"
 }
 
 daemon_lock_pid() {
@@ -133,6 +148,27 @@ daemon_lock_state() {
   fm_pid_alive "$pid" || return 1
   daemon_pid_matches "$pid" "$owner" || rc=$?
   return "$rc"
+}
+
+# daemon_lock_state, with its ambiguous state (2) resolved by INDEPENDENT positive
+# attribution instead of by trusting the fingerprint it cannot read. A daemon that
+# fingerprinted itself before the in-place identity-format change is alive, healthy,
+# and still attributable: reporting it as unidentifiable would make every /afk
+# refresh and away-mode recovery hard-fail, telling the captain to remove a lock a
+# LIVE daemon is holding - remediation whose only effect would be a second daemon.
+# So an attributed holder reads as held (0), and only a holder we cannot attribute
+# at all stays 2: never evicted, never signalled, never started beside, and always
+# refused loudly. This is the single lock reader for BOTH halves of /afk; a caller
+# that reads daemon_lock_state directly reintroduces the disagreement.
+daemon_lock_state_resolved() {
+  local rc=0 pid
+  daemon_lock_state || rc=$?
+  [ "$rc" -eq 2 ] || return "$rc"
+  pid=$(daemon_lock_pid 2>/dev/null || true)
+  daemon_pid_attributed "$pid" || return 2
+  printf 'afk: daemon lock identity is unreadable, but live pid=%s runs this home'"'"'s daemon and its own environment resolves to this home; treating it as the running daemon\n' \
+    "$pid" >&2
+  return 0
 }
 
 # Fail-closed must not mean fail-silent: refusing to act on an ambiguous lock is
@@ -161,7 +197,7 @@ fm_afk_start_main() {
 
   local pid lock_state=0
   pid=$(daemon_lock_pid 2>/dev/null || true)
-  daemon_lock_state || lock_state=$?
+  daemon_lock_state_resolved || lock_state=$?
   if [ "$lock_state" -eq 0 ]; then
     echo "afk: daemon already running pid=$pid"
     return 0

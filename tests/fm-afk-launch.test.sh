@@ -777,6 +777,48 @@ unit_legacy_daemon_lock_stops_an_attributed_daemon() {
   rm -rf "$st"
 }
 
+# The start half of that same contract: a live daemon behind a legacy fingerprint is
+# attributed and reported as already running, so an /afk refresh or an away-mode
+# recovery still refreshes the flag instead of hard-failing with advice to remove a
+# lock its own live daemon holds. Removing that lock is what WOULD start a second
+# daemon, so the refusal must be reserved for a holder we cannot attribute at all.
+unit_legacy_daemon_lock_start_refreshes_an_attributed_daemon() {
+  local st lock bincopy daemon_pid rc err
+  if [ ! -r "/proc/$$/environ" ]; then
+    echo "skip: attributing a live pid to its own home needs /proc (Linux)"
+    return 0
+  fi
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-legacy-start.XXXXXX")
+  mkdir -p "$st/state"
+  bincopy="$st/bin"
+  cp -R "$ROOT/bin" "$bincopy"
+  printf '#!/usr/bin/env bash\nsleep 60\n' > "$bincopy/fm-supervise-daemon.sh"
+  chmod +x "$bincopy/fm-supervise-daemon.sh"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$bincopy/fm-supervise-daemon.sh" &
+  daemon_pid=$!
+  lock="$st/state/.supervise-daemon.lock"
+  mkdir -p "$lock"
+  printf '%s' "$daemon_pid" > "$lock/pid"
+  printf 'Sun Jul 12 17:35:56 2026 bash %s\n' "$bincopy/fm-supervise-daemon.sh" > "$lock/pid-identity"
+
+  err=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$bincopy/fm-afk-launch.sh" start-native 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ] && [ -f "$st/state/.afk" ] \
+    && printf '%s' "$err" | grep -Fq 'daemon already running'; then
+    pass "legacy daemon lock: start attributes the live daemon and refreshes the away-mode flag"
+  else
+    fail "legacy daemon lock: start rc=$rc err=[$err]"
+  fi
+  if kill -0 "$daemon_pid" 2>/dev/null && [ -s "$lock/pid" ]; then
+    pass "legacy daemon lock: start neither evicted the lock nor disturbed the live daemon"
+  else
+    fail "legacy daemon lock: start evicted the lock or killed the attributed daemon"
+  fi
+  kill "$daemon_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  rm -rf "$st"
+}
+
 unit_stop_surfaces_afk_removal_failure() {
   local st
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-stop-remove.XXXXXX")
@@ -1044,6 +1086,7 @@ unit_lock_requires_complete_metadata
 unit_launch_lock_holds_on_unreadable_identity
 unit_legacy_daemon_lock_fails_loudly
 unit_legacy_daemon_lock_stops_an_attributed_daemon
+unit_legacy_daemon_lock_start_refreshes_an_attributed_daemon
 unit_stop_surfaces_afk_removal_failure
 unit_stop_confirms_daemon_exit
 unit_refresh_validates_record
