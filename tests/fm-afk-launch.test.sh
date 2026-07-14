@@ -886,6 +886,33 @@ unit_stop_completes_when_daemon_exits_mid_stop() {
   rm -rf "$st"
 }
 
+# The same race one step earlier: the lock still resolves but its pid file is
+# already gone, which daemon_lock_pid reports as EMPTY output on rc 0, not as a
+# failure. Stop must treat that exactly like a departed daemon - say so, then finish
+# the teardown - rather than silently skipping the fingerprint check and the SIGTERM
+# and clearing away mode with nothing said.
+unit_stop_reports_a_vanished_daemon_lock_pid() {
+  local st out rc
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-stop-empty-pid.XXXXXX")
+  mkdir -p "$st/state"
+  : > "$st/state/.afk"
+  printf 'none\t-\tnative\n' > "$st/state/.afk-daemon-terminal"
+  out=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    daemon_lock_state_resolved() { return 0; }
+    daemon_lock_pid() { printf "\n"; }
+    fm_afk_launch_stop
+  ' _ "$LAUNCH" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ] && [ ! -e "$st/state/.afk" ] \
+    && printf '%s' "$out" | grep -Fq 'lock vanished while stopping'; then
+    pass "stop race: an empty daemon-lock pid is reported and the teardown completes"
+  else
+    fail "stop race: an empty daemon-lock pid tore down silently (rc=$rc out=[$out])"
+  fi
+  rm -rf "$st"
+}
+
 # The other half: a holder that is still ALIVE but cannot be fingerprinted is real
 # ambiguity, not a departed daemon, so it is refused - loudly, naming the lock and
 # the remedy - and no lifecycle state is cleared.
@@ -1186,6 +1213,7 @@ unit_legacy_daemon_lock_fails_loudly
 unit_legacy_daemon_lock_stops_an_attributed_daemon
 unit_legacy_daemon_lock_start_refreshes_an_attributed_daemon
 unit_stop_completes_when_daemon_exits_mid_stop
+unit_stop_reports_a_vanished_daemon_lock_pid
 unit_stop_refuses_unfingerprintable_live_daemon
 unit_stop_surfaces_afk_removal_failure
 unit_stop_confirms_daemon_exit

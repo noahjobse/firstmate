@@ -622,12 +622,13 @@ if [ "$lock_rc" -eq 1 ] && watch_lock_lost_with_nothing_armed "$lock_rc"; then
   lock_rc=$?
 fi
 if [ "$lock_rc" -eq 2 ]; then
-  # We could not build a lock of our own (unwritable or full state dir, mktemp
-  # failing, ps unavailable to the stage hook), and no live holder exists: any lock
-  # still on disk names a dead watcher. This is not contention: reporting it as
-  # "already running" and exiting zero would leave supervision silently unarmed
-  # while the caller believed it was live.
-  echo "watcher: FAILED - could not create the watcher lock in $STATE (state dir unwritable or full, or ps unavailable)" >&2
+  # We ended up with no watcher lock and no live holder exists: either we could not
+  # build a lock of our own (unwritable or full state dir, mktemp failing, ps
+  # unavailable to the stage hook), or a lock proved reclaimable could not be
+  # removed - and that case has already named itself and its remedy on stderr. This
+  # is not contention: reporting it as "already running" and exiting zero would leave
+  # supervision silently unarmed while the caller believed it was live.
+  echo "watcher: FAILED - could not take the watcher lock in $STATE and no live watcher holds it (state dir unwritable or full, ps unavailable, or a reclaimable lock that could not be removed - see any message above)" >&2
   exit 1
 fi
 if watch_lock_lost_with_nothing_armed "$lock_rc"; then

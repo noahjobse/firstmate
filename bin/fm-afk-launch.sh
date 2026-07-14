@@ -667,10 +667,14 @@ fm_afk_launch_stop() {
     return 1
   fi
   if [ "$lock_state" -eq 0 ]; then
-    pid=$(daemon_lock_pid 2>/dev/null) || {
-      pid=""
+    # daemon_lock_pid reports a vanished pid file as EMPTY output on rc 0, not as a
+    # failure, so an empty read must be handled exactly like a failed one: silently
+    # skipping the fingerprint check and the SIGTERM on an empty pid would tear the
+    # terminal down and clear state/.afk having said nothing.
+    pid=$(daemon_lock_pid 2>/dev/null) || pid=""
+    if [ -z "$pid" ]; then
       fm_afk_launch_log "away-mode daemon lock vanished while stopping; the daemon has already exited, continuing teardown"
-    }
+    fi
   fi
   # A daemon that exits between the lock read above and these reads is the GOAL
   # state, not ambiguity: it has already run its own flush. Aborting here would skip

@@ -1186,6 +1186,36 @@ test_unremovable_reclaimable_lock_fails_loudly_never_as_contention() {
   pass "a reclaimable lock that cannot be removed fails loudly, never as contention with a dead pid"
 }
 
+test_discard_owner_only_removes_dirs_beside_their_lock() {
+  # The removal paths obtain the owner dir by readlink-ing the lock, so the
+  # recursive remove is aimed at whatever that link names. Only an owner dir minted
+  # beside its own lock may be removed recursively; a matching name somewhere else
+  # on disk must fall back to the conservative cleanup, which leaves a dir holding
+  # anything the lock helpers did not write.
+  local dir state lockdir foreign out
+  dir=$(make_case discard-owner-scope)
+  state="$dir/state"
+  lockdir="$state/.scoped.lock"
+  foreign="$dir/elsewhere/impostor.owner.abcdef"
+  mkdir -p "$foreign"
+  printf 'precious\n' > "$foreign/keepme"
+  ln -s "$foreign" "$lockdir"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1/$2 are the probe shell's own positional args
+  out=$(timeout 20 env FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_lock_remove_path "$2"
+    printf "rc=%s\n" "$?"
+  ' _ "$LIB" "$lockdir" 2>&1)
+  case "$out" in
+    *"rc=0"*) ;;
+    *) fail "removing a lock pointing outside the state dir did not succeed: $out" ;;
+  esac
+  [ ! -e "$lockdir" ] && [ ! -L "$lockdir" ] || fail "the lock symlink itself was not removed"
+  [ -f "$foreign/keepme" ] \
+    || fail "a dir outside the lock's own directory was recursively removed by its name alone"
+  pass "the owner-dir recursive remove is scoped to dirs minted beside their own lock"
+}
+
 test_pid_identity_accepts_a_pre_read_start_ticks() {
   # fm_pid_matches_identity reads the pid's start ticks once and hands the value to
   # both the format check and the identity read, so the recorded bytes must be
@@ -1528,6 +1558,7 @@ test_lock_acquire_fails_closed_on_an_unwritable_state_dir
 test_unwritable_state_dir_with_a_live_holder_is_contention
 test_contention_after_a_failed_steal_mutex_reports_no_own_failure
 test_unremovable_reclaimable_lock_fails_loudly_never_as_contention
+test_discard_owner_only_removes_dirs_beside_their_lock
 test_pid_identity_accepts_a_pre_read_start_ticks
 test_owner_dir_leaves_nothing_behind_when_a_stage_hook_writes_extra_files
 test_try_create_clears_stale_lock_signals_on_entry

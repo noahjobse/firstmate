@@ -6,9 +6,11 @@
 # holder must never write lock metadata through the lock path afterwards. See
 # fm_lock_stage_owner_meta and docs/incidents/2026-07-12-torn-watcher-lock.md.
 # The acquire helpers distinguish three outcomes: 0 held, 1 lost to another holder
-# (FM_LOCK_HELD_PID), and 2 when this holder could not build a lock at all and no
-# live holder exists (FM_LOCK_STAGE_FAILED) - which is our own failure, not
-# contention, and callers must fail loudly on it rather than stand down.
+# (FM_LOCK_HELD_PID), and 2 when this holder ended up with no lock and no live
+# holder exists (FM_LOCK_STAGE_FAILED) - either because it could not build a lock
+# at all, or because a lock it proved reclaimable could not be removed. That is our
+# own failure, not contention: callers must fail loudly on it rather than stand
+# down, and report the cause the library already printed rather than assert one.
 
 FM_WAKE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_WAKE_DEFAULT_ROOT="$(cd "$FM_WAKE_LIB_DIR/.." && pwd)"
@@ -442,8 +444,8 @@ fm_watcher_healthy() {
   return 0
 }
 
-# The single lock-presence predicate. rc 2's contract (we could not build a lock
-# AND no lock exists) is defined entirely in terms of it, so every reader of lock
+# The single lock-presence predicate. rc 2's contract (we hold no lock and no live
+# holder exists) is defined entirely in terms of it, so every reader of lock
 # presence goes through this one form: a symlinked lock is -L but not -e when its
 # owner dir is already gone, and a reader that tests only -e would call that lock
 # absent.
@@ -495,26 +497,39 @@ fm_lock_points_to_owner() {
   [ "$actual" = "$ownerdir" ]
 }
 
+# fm_lock_discard_owner <lockdir> <ownerdir>
 # An owner dir is this holder's private staging area, and a stage hook may put any
 # filename in it, so its contents are cleared generically rather than by a fixed
 # name list. A leftover file would defeat the rmdir and strand a
 # <lock>.owner.XXXXXX dir in the state dir on every acquire, and a state dir that
 # slowly fills is exactly what turns an ordinary lock failure into a supervision
-# outage. The pattern guard keeps the recursive remove aimed only at dirs
-# fm_lock_owner_dir minted; anything else falls back to the conservative path.
+# outage. On the removal paths the owner dir comes from readlink-ing the lock, so
+# a name check alone would aim the recursive remove at whatever that link named.
+# The lock is therefore passed in and the owner dir must resolve to
+# "<canonical lock>.owner.XXXXXX", the one shape fm_lock_owner_dir mints; anything
+# else falls back to the conservative path.
 fm_lock_discard_owner() {
-  local ownerdir=$1
+  local lockdir=$1 ownerdir=$2
   [ -n "$ownerdir" ] || return 0
-  case "${ownerdir##*/}" in
-    *.owner.??????)
-      if [ -d "$ownerdir" ] && [ ! -L "$ownerdir" ]; then
-        rm -rf "$ownerdir" 2>/dev/null || true
-        return 0
-      fi
-      ;;
-  esac
+  if fm_lock_owner_dir_belongs_to "$lockdir" "$ownerdir" &&
+    [ -d "$ownerdir" ] && [ ! -L "$ownerdir" ]; then
+    rm -rf "$ownerdir" 2>/dev/null || true
+    return 0
+  fi
   fm_lock_clean_known_files "$ownerdir"
   rmdir "$ownerdir" 2>/dev/null || true
+}
+
+fm_lock_owner_dir_belongs_to() {
+  local lockdir=$1 ownerdir=$2 lock_abs owner_abs suffix
+  case "${ownerdir##*/}" in
+    *.owner.??????) ;;
+    *) return 1 ;;
+  esac
+  lock_abs=$(fm_path_canonical_file "$lockdir") || return 1
+  owner_abs=$(fm_path_canonical_file "$ownerdir") || return 1
+  suffix=${owner_abs#"${lock_abs}.owner."}
+  [ "$suffix" != "$owner_abs" ]
 }
 
 fm_lock_remove_stray_owner_link() {
@@ -554,18 +569,18 @@ fm_lock_claim() {
     if ! fm_pid_alive "$back" && fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
       rm -f "$lockdir" 2>/dev/null || true
     fi
-    fm_lock_discard_owner "$ownerdir"
+    fm_lock_discard_owner "$lockdir" "$ownerdir"
     return 1
   fi
   if ! fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
-    fm_lock_discard_owner "$ownerdir"
+    fm_lock_discard_owner "$lockdir" "$ownerdir"
     return 1
   fi
   if fm_lock_claim_blocked_by_steal "$lockdir" "$allowed_steal_owner"; then
     if fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
       rm -f "$lockdir" 2>/dev/null || true
     fi
-    fm_lock_discard_owner "$ownerdir"
+    fm_lock_discard_owner "$lockdir" "$ownerdir"
     return 1
   fi
   return 0
@@ -587,13 +602,16 @@ fm_lock_stage_owner_meta() {
   "$stage_fn" "$ownerdir"
 }
 
-# The one gate every own-failure path goes through, so rc 2 can only ever mean
-# what it claims: we could not build a lock AND no lock exists. The failures that
-# stop us from building a lock - an unwritable or full state dir - are exactly the
-# ones that leave an existing holder's lock sitting untouched on disk, so a lock
-# that is present makes this contention (rc 1), never our own failure. Reporting a
-# held lock as "nothing is armed" is what lets a caller declare supervision dead
-# and its repair path terminate a live, healthy watcher because the disk is full.
+# The gate every could-not-build-a-lock path goes through, so rc 2 from those paths
+# can only ever mean what it claims: we could not build a lock AND no lock exists.
+# The failures that stop us from building a lock - an unwritable or full state dir -
+# are exactly the ones that leave an existing holder's lock sitting untouched on
+# disk, so a lock that is present makes this contention (rc 1), never our own
+# failure. Reporting a held lock as "nothing is armed" is what lets a caller declare
+# supervision dead and its repair path terminate a live, healthy watcher because the
+# disk is full. The one rc-2 path that does NOT come through here is the lock proved
+# reclaimable (dead holder) that could not be removed: no live holder exists there
+# either, so rc 2's promise holds, and fm_lock_try_acquire prints the cause itself.
 fm_lock_own_failure_rc() {
   local lockdir=$1
   if fm_lock_exists "$lockdir"; then
@@ -629,12 +647,12 @@ fm_lock_try_create() {
     return
   fi
   if ! fm_lock_prepare_owner "$ownerdir"; then
-    fm_lock_discard_owner "$ownerdir"
+    fm_lock_discard_owner "$lockdir" "$ownerdir"
     fm_lock_own_failure_rc "$lockdir"
     return
   fi
   if ! fm_lock_stage_owner_meta "$ownerdir" "$stage_fn"; then
-    fm_lock_discard_owner "$ownerdir"
+    fm_lock_discard_owner "$lockdir" "$ownerdir"
     fm_lock_own_failure_rc "$lockdir"
     return
   fi
@@ -649,7 +667,7 @@ fm_lock_try_create() {
   else
     fm_lock_remove_stray_owner_link "$lockdir" "$ownerdir"
   fi
-  fm_lock_discard_owner "$ownerdir"
+  fm_lock_discard_owner "$lockdir" "$ownerdir"
   return 1
 }
 
@@ -658,7 +676,7 @@ fm_lock_remove_path() {
   if [ -L "$lockdir" ]; then
     ownerdir=$(fm_lock_link_owner "$lockdir" 2>/dev/null || true)
     rm -f "$lockdir" 2>/dev/null || return 1
-    [ -n "$ownerdir" ] && fm_lock_discard_owner "$ownerdir"
+    [ -n "$ownerdir" ] && fm_lock_discard_owner "$lockdir" "$ownerdir"
     return 0
   fi
   fm_lock_clean_known_files "$lockdir"
@@ -855,11 +873,13 @@ fm_lock_try_acquire() {
 }
 
 # Waits out contention (rc 1: another holder, which always ends), but never an own
-# failure (rc 2: we cannot build a lock at all and no live holder exists, so no
-# holder is coming to release anything). That condition is permanent, so
-# retrying it would spin forever - and a caller blocked here queues nothing and
-# surfaces nothing, which is a silent total supervision failure. Returns 2, with
-# FM_LOCK_STAGE_FAILED set, so the caller can fail loudly instead.
+# failure (rc 2: we ended up with no lock and no live holder exists, so no holder is
+# coming to release anything). That condition is permanent, so retrying it would
+# spin forever - and a caller blocked here queues nothing and surfaces nothing,
+# which is a silent total supervision failure. Returns 2, with FM_LOCK_STAGE_FAILED
+# set, so the caller can fail loudly instead. An unremovable reclaimable lock names
+# its own remedy on stderr first, so this line offers the causes as possibilities
+# rather than asserting one that may not be what happened.
 fm_lock_acquire_wait() {
   local lockdir=$1 rc
   while :; do
@@ -867,7 +887,7 @@ fm_lock_acquire_wait() {
     rc=$?
     [ "$rc" -eq 0 ] && return 0
     if [ "$rc" -eq 2 ]; then
-      printf 'fm_lock_acquire_wait: cannot create the lock %s (state dir unwritable or full, or ps unavailable)\n' "$lockdir" >&2
+      printf 'fm_lock_acquire_wait: cannot take the lock %s and no live holder exists (state dir unwritable or full, ps unavailable, or a reclaimable lock that could not be removed - see any message above)\n' "$lockdir" >&2
       return 2
     fi
     sleep 0.1
@@ -884,7 +904,7 @@ fm_lock_release() {
     [ "$pid" = "$current" ] || return 0
     fm_lock_points_to_owner "$lockdir" "$ownerdir" || return 0
     rm -f "$lockdir" 2>/dev/null || return 0
-    fm_lock_discard_owner "$ownerdir"
+    fm_lock_discard_owner "$lockdir" "$ownerdir"
     return 0
   fi
   pid=$(cat "$lockdir/pid" 2>/dev/null || true)
