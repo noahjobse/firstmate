@@ -42,8 +42,12 @@ fm_pid_start_ticks() {
     "/proc/$pid/stat" 2>/dev/null
 }
 
+# <start_ticks>, when given, is this pid's already-read /proc start ticks, so a
+# caller that has just read them does not pay a second read of the same file.
+# Empty means "not read", and the ticks-primary/lstart-fallback order below runs
+# exactly as it does for a caller that passes nothing.
 fm_pid_identity() {
-  local pid=$1 start cmd
+  local pid=$1 start=${2:-} cmd
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
@@ -66,12 +70,14 @@ fm_pid_identity() {
   # lstart survives only as the fallback where /proc does not exist, and it is an
   # ACTIVELY DRIFTING primitive there, not an equivalent one. On a host with no
   # /proc AND a jittering btime, this class of false alarm is NOT fixed.
-  start=$(fm_pid_start_ticks "$pid") \
-    || start=$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null) \
-    || return 1
-  start=$(printf '%s' "$start" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  if [ -z "$start" ]; then
+    if ! start=$(fm_pid_start_ticks "$pid"); then
+      start=$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null) || return 1
+      start=$(printf '%s' "$start" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    fi
+  fi
   [ -n "$start" ] || return 1
-  printf '%s %s\n' "$start" "$cmd" | sed 's/^[[:space:]]*//'
+  printf '%s %s\n' "$start" "$cmd"
 }
 
 # Whether THIS host exposes start ticks at all, asked of a pid that is certainly
@@ -96,9 +102,12 @@ fm_host_identity_format() {
 # hidden - because that is an unknown format, not an lstart one. Inferring
 # "lstart" there would make a ticks identity look like a legacy one and send the
 # caller a manual-remediation instruction for a holder that is simply gone.
+# <start_ticks>, when given, is this pid's already-read start ticks; a non-empty
+# value IS the proof that the kernel exposes them for this pid, so it answers the
+# question without reading /proc a second time.
 fm_pid_identity_format() {
-  local pid=$1
-  if fm_pid_start_ticks "$pid" >/dev/null 2>&1; then
+  local pid=$1 start_ticks=${2:-}
+  if [ -n "$start_ticks" ] || fm_pid_start_ticks "$pid" >/dev/null 2>&1; then
     printf 'ticks\n'
     return 0
   fi
@@ -113,9 +122,9 @@ fm_pid_identity_format() {
 # match, only reported as unreadable - so a caller can tell a different process
 # apart from a holder this code cannot identify at all.
 fm_identity_is_current_format() {
-  local pid=$1 identity=$2 head format
+  local pid=$1 identity=$2 start_ticks=${3:-} head format
   [ -n "$identity" ] || return 1
-  format=$(fm_pid_identity_format "$pid") || return 2
+  format=$(fm_pid_identity_format "$pid" "$start_ticks") || return 2
   head=${identity%%[[:space:]]*}
   case "$format" in
     ticks)
@@ -149,14 +158,18 @@ fm_identity_is_current_format() {
 # holder that is merely DEAD is provably not the holder. Only a pid still alive
 # after a failed read is genuinely unidentifiable.
 fm_pid_matches_identity() {
-  local pid=$1 identity=$2 current
+  local pid=$1 identity=$2 current start_ticks
   [ -n "$identity" ] || return 1
   fm_pid_alive "$pid" || return 1
-  if ! fm_identity_is_current_format "$pid" "$identity"; then
+  # Read once and hand the value down: the format question and the identity itself
+  # are both answered from these ticks, and this runs on every guard call and on
+  # every poll of an attached arm.
+  start_ticks=$(fm_pid_start_ticks "$pid") || start_ticks=
+  if ! fm_identity_is_current_format "$pid" "$identity" "$start_ticks"; then
     fm_pid_alive "$pid" || return 1
     return 2
   fi
-  if ! current=$(fm_pid_identity "$pid"); then
+  if ! current=$(fm_pid_identity "$pid" "$start_ticks"); then
     fm_pid_alive "$pid" || return 1
     return 2
   fi
@@ -631,6 +644,10 @@ fm_lock_try_create() {
   return 1
 }
 
+fm_lock_exists() {
+  [ -e "$1" ] || [ -L "$1" ]
+}
+
 fm_lock_remove_path() {
   local lockdir=$1 ownerdir
   if [ -L "$lockdir" ]; then
@@ -779,7 +796,43 @@ fm_lock_try_acquire() {
     return
   fi
 
-  fm_lock_remove_path "$lockdir" || true
+  if ! fm_lock_remove_path "$lockdir" && fm_lock_exists "$lockdir"; then
+    # A removal that reports failure while a lock is still on disk is either the
+    # benign race - the stale lock had already gone (so the rmdir had nothing to
+    # remove) and a fresh holder has since claimed it - or the case that matters: a
+    # lock we PROVED reclaimable that cannot actually be removed, a legacy plain-dir
+    # lock holding an unexpected file, or a state dir gone read-only. A LIVE holder
+    # is ordinary contention, exactly as everywhere else on this path; anything else
+    # gets one more removal attempt (the lock now on disk may be a fresh, removable
+    # one) before we call it. The lock's age says nothing here, unlike elsewhere on
+    # this path: the failed removal has just cleared the known files out of a
+    # plain-dir lock and so touched its mtime, which would make the very lock we
+    # proved stale read as mid-acquire.
+    cur=$(cat "$lockdir/pid" 2>/dev/null || true)
+    if fm_pid_alive "$cur"; then
+      fm_lock_release "$steal"
+      fm_lock_contention_rc "$lockdir" "$cur"
+      return
+    fi
+    if ! fm_lock_remove_path "$lockdir" && fm_lock_exists "$lockdir"; then
+      # No live holder, and we cannot clear the lock that is blocking us. Swallowing
+      # this sends us into fm_lock_try_create, which sees the lock still there and
+      # returns 1, and the caller is handed the DEAD holder's pid as live
+      # contention: the watcher prints "already running pid <dead>" and exits zero
+      # with supervision unarmed. That is the fail-silent shape this path exists to
+      # prevent. Nothing is running and we could not build a lock, which is exactly
+      # rc 2, and it says so loudly and names the lock to remove.
+      fm_lock_release "$steal"
+      printf 'fm_lock_try_acquire: lock %s is reclaimable (no live holder) but could not be removed; remove %s and retry\n' \
+        "$lockdir" "$lockdir" >&2
+      # shellcheck disable=SC2034 # Read by callers after fm_lock_try_acquire returns.
+      FM_LOCK_HELD_PID=
+      FM_LOCK_OWNER_DIR=
+      # shellcheck disable=SC2034 # Read by callers after fm_lock_try_acquire returns.
+      FM_LOCK_STAGE_FAILED=1
+      return 2
+    fi
+  fi
   fm_lock_try_create "$lockdir" "$steal_owner" "$stage_fn"
   rc=$?
   if [ "$rc" -eq 2 ]; then

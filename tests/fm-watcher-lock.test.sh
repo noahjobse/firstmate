@@ -1150,6 +1150,67 @@ test_contention_after_a_failed_steal_mutex_reports_no_own_failure() {
   pass "contention never returns with an own-failure flag left over from the steal mutex"
 }
 
+test_unremovable_reclaimable_lock_fails_loudly_never_as_contention() {
+  # A lock proven reclaimable (dead holder, survived the stale recheck) whose
+  # removal fails - a legacy plain-dir lock holding an unexpected file, or a
+  # read-only state dir. Swallowing that failure hands the caller the DEAD holder's
+  # pid as live contention, and the watcher then prints "already running pid <dead>"
+  # and exits zero with supervision unarmed. It must be an own failure (rc 2), and
+  # it must name the lock.
+  local dir state lockdir dead out
+  dir=$(make_case unremovable-reclaimable-lock)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  dead=$(dead_pid)
+  mkdir -p "$lockdir"
+  printf '%s\n' "$dead" > "$lockdir/pid"
+  # An unexpected file the known-file cleanup does not know about, so the rmdir
+  # behind fm_lock_remove_path fails on a lock that is otherwise reclaimable.
+  printf 'x\n' > "$lockdir/unexpected"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1/$2 are the probe shell's own positional args
+  out=$(timeout 20 env FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_lock_try_acquire "$2"
+    printf "rc=%s held=[%s] staged_failed=[%s]\n" "$?" "${FM_LOCK_HELD_PID:-}" "${FM_LOCK_STAGE_FAILED:-}"
+  ' _ "$LIB" "$lockdir" 2>&1)
+  case "$out" in
+    *"rc=2 held=[] staged_failed=[1]"*) ;;
+    *) fail "an unremovable reclaimable lock was not reported as an own failure: $out" ;;
+  esac
+  case "$out" in
+    *"$lockdir"*) ;;
+    *) fail "the refusal did not name the lock that must be removed by hand: $out" ;;
+  esac
+  [ ! -e "$lockdir.steal" ] && [ ! -L "$lockdir.steal" ] \
+    || fail "the steal mutex was left behind after the refusal"
+  pass "a reclaimable lock that cannot be removed fails loudly, never as contention with a dead pid"
+}
+
+test_pid_identity_accepts_a_pre_read_start_ticks() {
+  # fm_pid_matches_identity reads the pid's start ticks once and hands the value to
+  # both the format check and the identity read, so the recorded bytes must be
+  # identical to the ones a caller that passes nothing produces.
+  local dir live from_read passed
+  dir=$(make_case identity-prereak-ticks)
+  if [ ! -r "/proc/$$/stat" ]; then
+    echo "skip: pre-read start ticks need /proc (Linux)"
+    pass "fm_pid_identity accepts a pre-read start ticks (skipped: no /proc)"
+    return
+  fi
+  sleep 30 &
+  live=$!
+  sleep 0.2
+  from_read=$(bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live")
+  passed=$(bash -c '. "$1"; fm_pid_identity "$2" "$(fm_pid_start_ticks "$2")"' _ "$LIB" "$live")
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  [ -n "$from_read" ] || fail "fm_pid_identity produced no identity for a live pid"
+  [ "$passed" = "$from_read" ] \
+    || fail "a pre-read start ticks changed the recorded identity (got '$passed', want '$from_read')"
+  rm -rf "$dir"
+  pass "fm_pid_identity with a pre-read start ticks records byte-identical bytes"
+}
+
 test_owner_dir_leaves_nothing_behind_when_a_stage_hook_writes_extra_files() {
   # A stage hook may stage any filename into its owner dir. If discard only cleared
   # a fixed name list, an extra file would defeat the rmdir and strand a
@@ -1466,6 +1527,8 @@ test_pid_home_matches_is_path_representation_independent
 test_lock_acquire_fails_closed_on_an_unwritable_state_dir
 test_unwritable_state_dir_with_a_live_holder_is_contention
 test_contention_after_a_failed_steal_mutex_reports_no_own_failure
+test_unremovable_reclaimable_lock_fails_loudly_never_as_contention
+test_pid_identity_accepts_a_pre_read_start_ticks
 test_owner_dir_leaves_nothing_behind_when_a_stage_hook_writes_extra_files
 test_try_create_clears_stale_lock_signals_on_entry
 test_watch_fails_loudly_when_the_state_dir_is_unwritable
