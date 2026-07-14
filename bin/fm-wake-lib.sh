@@ -442,6 +442,15 @@ fm_watcher_healthy() {
   return 0
 }
 
+# The single lock-presence predicate. rc 2's contract (we could not build a lock
+# AND no lock exists) is defined entirely in terms of it, so every reader of lock
+# presence goes through this one form: a symlinked lock is -L but not -e when its
+# owner dir is already gone, and a reader that tests only -e would call that lock
+# absent.
+fm_lock_exists() {
+  [ -e "$1" ] || [ -L "$1" ]
+}
+
 fm_lock_clean_known_files() {
   local lockdir=$1
   rm -f \
@@ -519,7 +528,7 @@ fm_lock_remove_stray_owner_link() {
 fm_lock_claim_blocked_by_steal() {
   local lockdir=$1 allowed_steal_owner=${2:-} steal
   steal="$lockdir.steal"
-  [ -e "$steal" ] || [ -L "$steal" ] || return 1
+  fm_lock_exists "$steal" || return 1
   if [ -n "$allowed_steal_owner" ] && fm_lock_points_to_owner "$steal" "$allowed_steal_owner"; then
     return 1
   fi
@@ -587,7 +596,7 @@ fm_lock_stage_owner_meta() {
 # and its repair path terminate a live, healthy watcher because the disk is full.
 fm_lock_own_failure_rc() {
   local lockdir=$1
-  if [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
+  if fm_lock_exists "$lockdir"; then
     return 1
   fi
   # shellcheck disable=SC2034 # Read by callers after the lock helpers return.
@@ -612,7 +621,7 @@ fm_lock_try_create() {
   FM_LOCK_OWNER_DIR=
   FM_LOCK_HELD_PID=
   FM_LOCK_STAGE_FAILED=
-  if [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
+  if fm_lock_exists "$lockdir"; then
     return 1
   fi
   if ! ownerdir=$(fm_lock_owner_dir "$lockdir") || [ -z "$ownerdir" ]; then
@@ -644,10 +653,6 @@ fm_lock_try_create() {
   return 1
 }
 
-fm_lock_exists() {
-  [ -e "$1" ] || [ -L "$1" ]
-}
-
 fm_lock_remove_path() {
   local lockdir=$1 ownerdir
   if [ -L "$lockdir" ]; then
@@ -677,7 +682,7 @@ fm_lock_recheck_stale_owner() {
   local lockdir=$1 expected_owner=$2 expected_pid=$3 actual_pid
   if [ -n "$expected_owner" ]; then
     fm_lock_points_to_owner "$lockdir" "$expected_owner" || return 1
-  elif [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
+  elif fm_lock_exists "$lockdir"; then
     [ -d "$lockdir" ] && [ ! -L "$lockdir" ] || return 1
   fi
   actual_pid=$(cat "$lockdir/pid" 2>/dev/null || true)

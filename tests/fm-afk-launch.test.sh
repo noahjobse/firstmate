@@ -857,6 +857,64 @@ unit_legacy_daemon_lock_start_refreshes_an_attributed_daemon() {
   rm -rf "$st"
 }
 
+# The daemon exits between stop's lock read and its identity read - the plausible
+# race, since the captain's return is both what ends away mode and what makes the
+# daemon exit. The daemon being gone is the GOAL state, so stop must finish the
+# teardown (close the terminal, clear .afk) and say so, never stand down silently
+# with away mode half-exited.
+unit_stop_completes_when_daemon_exits_mid_stop() {
+  local st out rc dead_pid
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-stop-race.XXXXXX")
+  mkdir -p "$st/state"
+  : > "$st/state/.afk"
+  printf 'none\t-\tnative\n' > "$st/state/.afk-daemon-terminal"
+  sleep 0 & dead_pid=$!
+  wait "$dead_pid" 2>/dev/null || true
+  out=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" DEAD_PID="$dead_pid" bash -c '
+    . "$1"
+    daemon_lock_state_resolved() { return 0; }
+    daemon_lock_pid() { printf "%s\n" "$DEAD_PID"; }
+    fm_afk_launch_stop
+  ' _ "$LAUNCH" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ] && [ ! -e "$st/state/.afk" ] \
+    && printf '%s' "$out" | grep -Fq 'already exited'; then
+    pass "stop race: a daemon that exits mid-stop is reported and the teardown completes"
+  else
+    fail "stop race: stop stood down silently and left away mode half-exited (rc=$rc out=[$out])"
+  fi
+  rm -rf "$st"
+}
+
+# The other half: a holder that is still ALIVE but cannot be fingerprinted is real
+# ambiguity, not a departed daemon, so it is refused - loudly, naming the lock and
+# the remedy - and no lifecycle state is cleared.
+unit_stop_refuses_unfingerprintable_live_daemon() {
+  local st out rc sleeper_pid
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-stop-unfingerprintable.XXXXXX")
+  mkdir -p "$st/state"
+  : > "$st/state/.afk"
+  printf 'none\t-\tnative\n' > "$st/state/.afk-daemon-terminal"
+  sleep 30 & sleeper_pid=$!
+  out=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" LIVE_PID="$sleeper_pid" bash -c '
+    . "$1"
+    daemon_lock_state_resolved() { return 0; }
+    daemon_lock_pid() { printf "%s\n" "$LIVE_PID"; }
+    fm_pid_identity() { return 1; }
+    fm_afk_launch_stop
+  ' _ "$LAUNCH" 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ] && [ -e "$st/state/.afk" ] && kill -0 "$sleeper_pid" 2>/dev/null \
+    && printf '%s' "$out" | grep -Fq 'cannot fingerprint live away-mode daemon'; then
+    pass "stop race: an unfingerprintable LIVE daemon is refused loudly with state preserved"
+  else
+    fail "stop race: unfingerprintable live daemon rc=$rc out=[$out]"
+  fi
+  kill "$sleeper_pid" 2>/dev/null || true
+  wait "$sleeper_pid" 2>/dev/null || true
+  rm -rf "$st"
+}
+
 unit_stop_surfaces_afk_removal_failure() {
   local st
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-stop-remove.XXXXXX")
@@ -1127,6 +1185,8 @@ unit_launch_lock_holds_on_unreadable_identity
 unit_legacy_daemon_lock_fails_loudly
 unit_legacy_daemon_lock_stops_an_attributed_daemon
 unit_legacy_daemon_lock_start_refreshes_an_attributed_daemon
+unit_stop_completes_when_daemon_exits_mid_stop
+unit_stop_refuses_unfingerprintable_live_daemon
 unit_stop_surfaces_afk_removal_failure
 unit_stop_confirms_daemon_exit
 unit_refresh_validates_record

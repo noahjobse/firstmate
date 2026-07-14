@@ -602,7 +602,7 @@ stage_watch_lock_meta() {
 }
 
 watch_lock_is_absent() {
-  [ ! -e "$WATCH_LOCK" ] && [ ! -L "$WATCH_LOCK" ]
+  ! fm_lock_exists "$WATCH_LOCK"
 }
 
 # True only for a loss that leaves nothing behind: no holder pid was recorded and

@@ -131,11 +131,11 @@ fm_afk_launch_stage_lock_meta() {
 }
 
 fm_afk_launch_remove_reclaimable_lock() {
-  [ -e "$FM_AFK_LAUNCH_LOCK" ] || [ -L "$FM_AFK_LAUNCH_LOCK" ] || return 0
+  fm_lock_exists "$FM_AFK_LAUNCH_LOCK" || return 0
   if fm_lock_remove_path "$FM_AFK_LAUNCH_LOCK" 2>/dev/null; then
     return 0
   fi
-  [ -e "$FM_AFK_LAUNCH_LOCK" ] || [ -L "$FM_AFK_LAUNCH_LOCK" ] || return 0
+  fm_lock_exists "$FM_AFK_LAUNCH_LOCK" || return 0
   fm_afk_launch_log "launcher lock $FM_AFK_LAUNCH_LOCK is reclaimable but could not be removed; remove $FM_AFK_LAUNCH_LOCK and retry."
   return 1
 }
@@ -667,11 +667,27 @@ fm_afk_launch_stop() {
     return 1
   fi
   if [ "$lock_state" -eq 0 ]; then
-    pid=$(daemon_lock_pid 2>/dev/null) || return 1
+    pid=$(daemon_lock_pid 2>/dev/null) || {
+      pid=""
+      fm_afk_launch_log "away-mode daemon lock vanished while stopping; the daemon has already exited, continuing teardown"
+    }
+  fi
+  # A daemon that exits between the lock read above and these reads is the GOAL
+  # state, not ambiguity: it has already run its own flush. Aborting here would skip
+  # the terminal close and leave state/.afk set, half-exiting away mode with nothing
+  # said - the fail-silent stand-down AGENTS.md section 8 forbids. So a pid that is
+  # no longer alive drops through to teardown with a log, and only a LIVE pid we
+  # cannot fingerprint (ps unavailable) is refused, loudly.
+  if [ -n "$pid" ] && ! pid_identity=$(fm_pid_identity "$pid" 2>/dev/null); then
+    if fm_pid_alive "$pid"; then
+      fm_afk_launch_log "cannot fingerprint live away-mode daemon pid=$pid; refusing to signal it. If pid $pid is not the away-mode daemon, remove $FM_AFK_LOCK and retry."
+      return 1
+    fi
+    fm_afk_launch_log "away-mode daemon pid=$pid already exited; continuing teardown"
+    pid=""
   fi
   if [ -n "$pid" ]; then
-    pid_identity=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
-    if ! kill -TERM "$pid" 2>/dev/null; then
+    if ! kill -TERM "$pid" 2>/dev/null && fm_pid_alive "$pid"; then
       fm_afk_launch_log "failed to signal away-mode daemon pid=$pid"
       result=1
     fi
