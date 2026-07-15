@@ -205,7 +205,10 @@ main() {
   . "$SCRIPT_DIR/fm-classify-lib.sh"
 
   mkdir -p "$STATE" || return 1
-  fm_lock_acquire_wait "$LOCK"
+  if ! fm_lock_acquire_wait "$LOCK"; then
+    printf 'fm-afk-return: FAILED - could not lock %s and no live holder exists (state dir unwritable or full); return catch-up was NOT processed\n' "$LOCK" >&2
+    return 1
+  fi
   trap 'fm_lock_release "$LOCK"' EXIT
   write_pending_seed || { fm_lock_release "$LOCK"; trap - EXIT; return 1; }
   return_reconcile
