@@ -1235,6 +1235,16 @@ trim_log() {
   tail -n "${FM_LOG_KEEP_LINES:-$LOG_KEEP_LINES_DEFAULT}" "$LOG" >"$tmp" 2>/dev/null && mv -f "$tmp" "$LOG"
 }
 
+# Stage hook for the daemon's singleton lock: fm_lock_try_acquire calls this with
+# the owner dir before publishing the lock, so the lock is never observable with a
+# pid but no identity. Runs in the acquiring shell, so ${BASHPID:-$$} is the pid
+# the lock records.
+stage_daemon_lock_meta() {
+  local ownerdir=$1
+  fm_pid_identity "${BASHPID:-$$}" > "$ownerdir/pid-identity" 2>/dev/null || return 1
+  [ -s "$ownerdir/pid-identity" ]
+}
+
 # ============================================================================
 # Everything below runs only when the script is EXECUTED, not sourced. The pure
 # classifiers above are sourceable for unit tests (tests/fm-daemon.test.sh).
@@ -1264,16 +1274,30 @@ fm_super_main() {
   [ -x "$WATCH" ] || { echo "error: watcher not found or not executable: $WATCH" >&2; exit 1; }
 
   # --- single instance (portable lock, no flock dependency) ------------------
-  if ! fm_lock_try_acquire "$LOCK"; then
+  # Identity is staged into the owner dir before the lock publishes, never written
+  # through the lock path afterwards; see fm_lock_stage_owner_meta.
+  local lock_rc
+  fm_lock_try_acquire "$LOCK" stage_daemon_lock_meta
+  lock_rc=$?
+  if [ "$lock_rc" -eq 2 ]; then
+    # We ended up with no lock and no live holder exists (any lock still on disk
+    # names a dead daemon, and an unremovable one has already named itself and its
+    # remedy on stderr), so this is not contention and must not be reported as
+    # another daemon running.
+    echo "error: could not take the daemon lock $LOCK and no live daemon holds it (state dir unwritable or full, ps unavailable, or a reclaimable lock that could not be removed - see any message above)" >&2
+    exit 1
+  fi
+  if [ "$lock_rc" -ne 0 ]; then
     if [ -n "${FM_LOCK_HELD_PID:-}" ]; then
       echo "error: another fm-supervise-daemon is already running (pid $FM_LOCK_HELD_PID, lock $LOCK held)" >&2
-    else
+    elif [ -e "$LOCK" ] || [ -L "$LOCK" ]; then
       echo "error: another fm-supervise-daemon is already running (lock $LOCK held)" >&2
+    else
+      echo "error: could not acquire the daemon lock $LOCK and no lock is present; the daemon is NOT running" >&2
     fi
     exit 1
   fi
   echo "$$" > "$PIDFILE"
-  fm_pid_identity "${BASHPID:-$$}" > "$LOCK/pid-identity" 2>/dev/null || true
 
   # --- auto-discover the supervisor BACKEND (tmux vs herdr) first -----------
   # Priority: FM_SUPERVISOR_BACKEND override > $TMUX_PANE (tmux) > $HERDR_ENV=1

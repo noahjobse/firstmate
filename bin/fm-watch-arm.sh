@@ -47,6 +47,15 @@
 # bin/fm-watch.sh`: that pattern matches every firstmate home's watcher
 # (secondmate homes run the same script) and would kill siblings. Restart never
 # takes the attach path.
+#
+# Attributing a pid to a home reads that process's own environment through /proc,
+# so it is Linux-only. On macOS a live holder behind a LEGACY torn lock (one
+# written by a pre-fix firstmate) can be neither attributed nor safely signalled,
+# so --restart leaves both the process and its lock untouched and the home reports
+# FAILED until that watcher is stopped by hand once. Torn locks can no longer form
+# once identity is published atomically (fm_lock_stage_owner_meta), so this affects
+# only a lock left on disk by an older version. See
+# docs/incidents/2026-07-12-torn-watcher-lock.md.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -63,13 +72,21 @@ CONFIRM_TIMEOUT=${FM_ARM_CONFIRM_TIMEOUT:-10}
 # Poll interval while attached to an existing healthy watcher.
 ATTACH_POLL=${FM_ARM_ATTACH_POLL:-0.5}
 
+# Removes only a lock this home itself recorded. Home and watcher path are both
+# canonicalised on both sides, exactly as fm_watcher_lock_matches_pid canonicalises
+# the check this backstops: FM_HOME and the bin dir arrive spelled however the
+# environment spells them (a trailing slash, a path through a symlink), and a raw
+# compare would fail a home against its OWN stale lock and leave it behind.
+# Canonicalising only makes the match more accurate; it never widens what may be
+# removed.
 clear_stale_recorded_watcher_lock() {
   local lock_home lock_path lock_identity
   lock_home=$(cat "$WATCH_LOCK/fm-home" 2>/dev/null || true)
   lock_path=$(cat "$WATCH_LOCK/watcher-path" 2>/dev/null || true)
   lock_identity=$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)
-  [ "$lock_home" = "$FM_HOME" ] || return 0
-  [ "$lock_path" = "$WATCH" ] || return 0
+  [ -n "$lock_path" ] || return 0
+  fm_path_same_dir "$lock_home" "$FM_HOME" || return 0
+  fm_path_same_file "$lock_path" "$WATCH" || return 0
   [ -n "$lock_identity" ] || return 0
   fm_lock_remove_path "$WATCH_LOCK" || true
 }
@@ -139,7 +156,25 @@ if [ "$mode" = restart ]; then
   # Home-scoped stop: only the watcher pid recorded in THIS home's lock.
   lock_pid=$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)
   if fm_pid_alive "$lock_pid"; then
-    if fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$lock_pid" "$FM_HOME"; then
+    # Stop the holder when the lock's own identity vouches for it, OR when the live
+    # pid is demonstrably running this watcher script AND that process is provably
+    # THIS home's. The second arm is not redundant: a lock written by a pre-fix
+    # firstmate can be TORN (pid naming one watcher, pid-identity fingerprinting
+    # another), and without it restart would take the clear-the-lock branch below
+    # and yank the lock out from under a live watcher WITHOUT stopping it - turning
+    # a misread into a real outage, exactly as in
+    # docs/incidents/2026-07-12-torn-watcher-lock.md. But a command-path match
+    # alone can never authorise a kill: bin/fm-watch.sh is the SAME script in every
+    # firstmate home, secondmates included, so a stale pid this home recorded and
+    # the OS since recycled onto a SIBLING home's watcher would match it, and we
+    # would kill that home's supervision - the hazard AGENTS.md names as `pkill -f
+    # bin/fm-watch.sh`. So the pid must first be positively attributed to this home
+    # (its own FM_HOME). A live holder we cannot attribute is never signalled and
+    # never has its lock yanked; it falls through to the honest FAILED/healthy
+    # report below.
+    if fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$lock_pid" "$FM_HOME" \
+      || { fm_pid_runs_command "$lock_pid" "$WATCH" \
+        && fm_pid_home_matches "$lock_pid" "$FM_HOME"; }; then
       kill -TERM "$lock_pid" 2>/dev/null || true
       # Wait for it to actually exit before relaunching, so the fresh watcher
       # either takes a released lock or reclaims a now-dead-pid stale lock instead
@@ -149,7 +184,16 @@ if [ "$mode" = restart ]; then
         sleep 0.1
         i=$((i + 1))
       done
+    elif fm_pid_runs_command "$lock_pid" "$WATCH" && ! fm_pid_home_readable "$lock_pid"; then
+      # A live watcher process whose home cannot be read here (no /proc). It may be
+      # this home's own watcher behind a torn lock, or a sibling's. Signalling it
+      # could kill another home's supervision; clearing the lock could strand our
+      # own watcher. Do neither - the honest FAILED report below surfaces it.
+      echo "watcher: lock pid $lock_pid runs $WATCH but cannot be attributed to a firstmate home; leaving it and its lock untouched" >&2
     else
+      # Either an unrelated reused pid, or a watcher positively attributed to a
+      # DIFFERENT home. In both cases nothing of ours holds this lock, so replacing
+      # this home's stale lock is safe and touches no other home's process.
       clear_stale_recorded_watcher_lock
     fi
   fi

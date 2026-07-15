@@ -81,7 +81,7 @@ unit_fresh_vs_refresh() {
   : > "$st/state/.subsuper-escalations"
   : > "$st/state/.subsuper-inject-wedged"
   # A live "daemon": a real process whose identity the lock records, so
-  # daemon_lock_held_by_live_daemon returns true (a refresh).
+  # daemon_lock_state reports it as positively identified (a refresh).
   sleep 600 &
   sleep_pid=$!
   lock="$st/state/.supervise-daemon.lock"
@@ -151,7 +151,9 @@ unit_stop_rejects_reused_pid() {
   lock="$st/state/.supervise-daemon.lock"
   mkdir -p "$lock"
   printf '%s' "$sleeper_pid" > "$lock/pid"
-  printf 'different-process-identity' > "$lock/pid-identity"
+  # A well-formed fingerprint of a DIFFERENT process (this test shell): the lock's
+  # pid was recycled onto an unrelated live process, which stop must never signal.
+  ( . "$ROOT/bin/fm-wake-lib.sh"; fm_pid_identity "$$" > "$lock/pid-identity" )
   FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop >/dev/null 2>&1
   if kill -0 "$sleeper_pid" 2>/dev/null; then
     pass "stop identity: stale lock cannot signal an unrelated live process"
@@ -620,6 +622,326 @@ unit_lock_requires_complete_metadata() {
   rm -rf "$st"
 }
 
+unit_lock_reclaim_is_loud_when_removal_fails() {
+  local st rc err
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-lock-reclaim.XXXXXX")
+  mkdir -p "$st/state/.afk-launch.lock"
+  : > "$st/state/.afk-launch.lock/unexpected-file"
+  err=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    fm_afk_launch_remove_reclaimable_lock
+    exit $?
+  ' _ "$LAUNCH" 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ] && [ -e "$st/state/.afk-launch.lock/unexpected-file" ] \
+    && printf '%s' "$err" | grep -Fq "$st/state/.afk-launch.lock"; then
+    pass "launcher lock: failed reclaim exits loudly with the exact lock path"
+  else
+    fail "launcher lock: failed reclaim rc=$rc err=[$err]"
+  fi
+  rm -rf "$st"
+}
+
+unit_lock_reclaim_tolerates_vanished_lock() {
+  local st rc err
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-lock-vanished.XXXXXX")
+  mkdir -p "$st/state"
+  err=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    fm_afk_launch_remove_reclaimable_lock
+    exit $?
+  ' _ "$LAUNCH" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ] && [ -z "$err" ]; then
+    pass "launcher lock: vanished reclaim lock is treated as already removed"
+  else
+    fail "launcher lock: vanished reclaim lock rc=$rc err=[$err]"
+  fi
+  rm -rf "$st"
+}
+
+unit_launch_lock_holds_on_unreadable_identity() {
+  # A launcher that started before an in-place update fingerprinted itself in the
+  # old identity format. The acquire loop REMOVES a lock it reads as unowned, so an
+  # identity this version cannot read must never read as unowned: never evict a live
+  # holder, never run two launchers at once. It must not read as ordinary contention
+  # either - waiting out the loop on a holder that may never let go is the silent
+  # wedge. It fails FAST, non-zero, naming the lock to remove. A dead holder with the
+  # same unreadable identity is still reclaimed, so this never blocks a real start.
+  local st sleeper_pid live_rc live_err stale_rc
+  if [ ! -r "/proc/$$/stat" ]; then
+    echo "skip: the legacy-identity transition needs the /proc start-ticks format (Linux)"
+    return 0
+  fi
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-launch-legacy.XXXXXX")
+  mkdir -p "$st/state/.afk-launch.lock"
+  sleep 30 &
+  sleeper_pid=$!
+  printf '%s' "$sleeper_pid" > "$st/state/.afk-launch.lock/pid"
+  printf 'Sun Jul 12 17:35:56 2026 sleep 30\n' > "$st/state/.afk-launch.lock/pid-identity"
+  live_err=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    fm_afk_launch_lock_acquire
+    exit $?
+  ' _ "$LAUNCH" 2>&1)
+  live_rc=$?
+  if [ "$live_rc" -ne 0 ] \
+    && [ -f "$st/state/.afk-launch.lock/pid" ] \
+    && printf '%s' "$live_err" | grep -Fq "$st/state/.afk-launch.lock"; then
+    pass "launcher lock: a live holder with an unreadable identity is never evicted, and the refusal names the lock"
+  else
+    fail "launcher lock: unreadable live identity rc=$live_rc err=[$live_err]"
+  fi
+  kill "$sleeper_pid" 2>/dev/null || true
+  wait "$sleeper_pid" 2>/dev/null || true
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    fm_afk_launch_lock_acquire
+    exit $?
+  ' _ "$LAUNCH" >/dev/null 2>&1
+  stale_rc=$?
+  if [ "$stale_rc" -eq 0 ]; then
+    pass "launcher lock: a DEAD holder with an unreadable identity is still reclaimed"
+  else
+    fail "launcher lock: dead holder with an unreadable identity was not reclaimed (rc=$stale_rc)"
+  fi
+  rm -rf "$st"
+}
+
+# The away-mode daemon lock, held by a LIVE process whose recorded identity this
+# version cannot read (a daemon that fingerprinted itself before an in-place
+# update). Both halves of /afk must agree: never evict it, never spawn a second
+# daemon beside it, never signal a pid we cannot attribute - and never do any of
+# that silently, or a recycled pid behind a stale legacy lock wedges away mode
+# forever with nothing telling the captain which lock to remove.
+unit_legacy_daemon_lock_fails_loudly() {
+  local st lock sleeper_pid start_rc start_err stop_rc stop_err
+  if [ ! -r "/proc/$$/stat" ]; then
+    echo "skip: the legacy-identity transition needs the /proc start-ticks format (Linux)"
+    return 0
+  fi
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-legacy-daemon.XXXXXX")
+  mkdir -p "$st/state"
+  date '+%s' > "$st/state/.afk"
+  # An unrelated live process the lock's pid was recycled onto, behind an identity
+  # in the old format: unattributable, so it is neither signalled nor evicted.
+  sleep 30 &
+  sleeper_pid=$!
+  lock="$st/state/.supervise-daemon.lock"
+  mkdir -p "$lock"
+  printf '%s' "$sleeper_pid" > "$lock/pid"
+  printf 'Sun Jul 12 17:35:56 2026 sleep 30\n' > "$lock/pid-identity"
+
+  start_err=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_SUPERVISOR_TARGET=unused \
+    FM_SUPERVISOR_BACKEND=tmux "$LAUNCH" start 2>&1)
+  start_rc=$?
+  if [ "$start_rc" -ne 0 ] \
+    && printf '%s' "$start_err" | grep -Fq "$lock" \
+    && [ ! -e "$st/state/.afk-daemon-terminal" ]; then
+    pass "legacy daemon lock: start refuses non-zero, names the lock, and spawns no second daemon"
+  else
+    fail "legacy daemon lock: start rc=$start_rc err=[$start_err]"
+  fi
+
+  stop_err=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop 2>&1)
+  stop_rc=$?
+  if [ "$stop_rc" -ne 0 ] && printf '%s' "$stop_err" | grep -Fq "$lock"; then
+    pass "legacy daemon lock: stop refuses non-zero and names the lock"
+  else
+    fail "legacy daemon lock: stop rc=$stop_rc err=[$stop_err]"
+  fi
+  if kill -0 "$sleeper_pid" 2>/dev/null; then
+    pass "legacy daemon lock: an unattributable live holder is never signalled"
+  else
+    fail "legacy daemon lock: stop signalled a process it could not attribute"
+  fi
+  if [ -f "$st/state/.afk" ]; then
+    pass "legacy daemon lock: a refused stop preserves away-mode lifecycle state"
+  else
+    fail "legacy daemon lock: a refused stop cleared .afk anyway"
+  fi
+  kill "$sleeper_pid" 2>/dev/null || true
+  wait "$sleeper_pid" 2>/dev/null || true
+  rm -rf "$st"
+}
+
+# The other half of the same contract: a live holder whose identity is unreadable
+# but which is positively attributed to this home (it runs this home's daemon
+# script, and its own environment resolves here) IS ours, legacy fingerprint or
+# not. It must be SIGTERMed while state/.afk is still present, or its cleanup trap
+# never flushes buffered escalations and it is hard-killed with the terminal.
+unit_legacy_daemon_lock_stops_an_attributed_daemon() {
+  local st lock marker daemon_pid
+  if [ ! -r "/proc/$$/stat" ]; then
+    echo "skip: the legacy-identity transition needs the /proc start-ticks format (Linux)"
+    return 0
+  fi
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-legacy-attributed.XXXXXX")
+  mkdir -p "$st/state"
+  date '+%s' > "$st/state/.afk"
+  marker="$st/afk-at-term"
+  bash -c '
+    trap "if [ -f \"$1/state/.afk\" ]; then echo present > \"$2\"; else echo absent > \"$2\"; fi; exit 0" TERM
+    while :; do sleep 0.2; done
+  ' _ "$st" "$marker" &
+  daemon_pid=$!
+  lock="$st/state/.supervise-daemon.lock"
+  mkdir -p "$lock"
+  printf '%s' "$daemon_pid" > "$lock/pid"
+  printf 'Sun Jul 12 17:35:56 2026 bash %s\n' "$ROOT/bin/fm-supervise-daemon.sh" > "$lock/pid-identity"
+  printf 'none\t-\tnative\n' > "$st/state/.afk-daemon-terminal"
+  # The attribution the real stop performs (runs this home's daemon script, and its
+  # own environment resolves to this home) is stubbed, because this fake daemon is
+  # not literally exec'ing fm-supervise-daemon.sh. What is under test is that stop
+  # SIGTERMs a holder its attribution vouches for even when the lock identity does not.
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    fm_pid_runs_command() { fm_pid_alive "$1"; }
+    fm_pid_home_matches() { fm_pid_alive "$1"; }
+    fm_afk_launch_stop
+  ' _ "$LAUNCH" >/dev/null 2>&1
+  if [ "$(cat "$marker" 2>/dev/null || echo missing)" = present ]; then
+    pass "legacy daemon lock: an ATTRIBUTED live holder is SIGTERM'd while .afk is still present"
+  else
+    fail "legacy daemon lock: an attributed live holder was not SIGTERM'd before .afk was cleared"
+  fi
+  if [ ! -e "$st/state/.afk" ]; then
+    pass "legacy daemon lock: away mode can still be stopped behind a legacy fingerprint"
+  else
+    fail "legacy daemon lock: stop left .afk in place for an attributed holder"
+  fi
+  kill "$daemon_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  rm -rf "$st"
+}
+
+# The start half of that same contract: a live daemon behind a legacy fingerprint is
+# attributed and reported as already running, so an /afk refresh or an away-mode
+# recovery still refreshes the flag instead of hard-failing with advice to remove a
+# lock its own live daemon holds. Removing that lock is what WOULD start a second
+# daemon, so the refusal must be reserved for a holder we cannot attribute at all.
+unit_legacy_daemon_lock_start_refreshes_an_attributed_daemon() {
+  local st lock bincopy daemon_pid rc err
+  if [ ! -r "/proc/$$/environ" ]; then
+    echo "skip: attributing a live pid to its own home needs /proc (Linux)"
+    return 0
+  fi
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-legacy-start.XXXXXX")
+  mkdir -p "$st/state"
+  bincopy="$st/bin"
+  cp -R "$ROOT/bin" "$bincopy"
+  printf '#!/usr/bin/env bash\nsleep 60\n' > "$bincopy/fm-supervise-daemon.sh"
+  chmod +x "$bincopy/fm-supervise-daemon.sh"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$bincopy/fm-supervise-daemon.sh" &
+  daemon_pid=$!
+  lock="$st/state/.supervise-daemon.lock"
+  mkdir -p "$lock"
+  printf '%s' "$daemon_pid" > "$lock/pid"
+  printf 'Sun Jul 12 17:35:56 2026 bash %s\n' "$bincopy/fm-supervise-daemon.sh" > "$lock/pid-identity"
+
+  err=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$bincopy/fm-afk-launch.sh" start-native 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ] && [ -f "$st/state/.afk" ] \
+    && printf '%s' "$err" | grep -Fq 'daemon already running'; then
+    pass "legacy daemon lock: start attributes the live daemon and refreshes the away-mode flag"
+  else
+    fail "legacy daemon lock: start rc=$rc err=[$err]"
+  fi
+  if kill -0 "$daemon_pid" 2>/dev/null && [ -s "$lock/pid" ]; then
+    pass "legacy daemon lock: start neither evicted the lock nor disturbed the live daemon"
+  else
+    fail "legacy daemon lock: start evicted the lock or killed the attributed daemon"
+  fi
+  kill "$daemon_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  rm -rf "$st"
+}
+
+# The daemon exits between stop's lock read and its identity read - the plausible
+# race, since the captain's return is both what ends away mode and what makes the
+# daemon exit. The daemon being gone is the GOAL state, so stop must finish the
+# teardown (close the terminal, clear .afk) and say so, never stand down silently
+# with away mode half-exited.
+unit_stop_completes_when_daemon_exits_mid_stop() {
+  local st out rc dead_pid
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-stop-race.XXXXXX")
+  mkdir -p "$st/state"
+  : > "$st/state/.afk"
+  printf 'none\t-\tnative\n' > "$st/state/.afk-daemon-terminal"
+  sleep 0 & dead_pid=$!
+  wait "$dead_pid" 2>/dev/null || true
+  out=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" DEAD_PID="$dead_pid" bash -c '
+    . "$1"
+    daemon_lock_state_resolved() { return 0; }
+    daemon_lock_pid() { printf "%s\n" "$DEAD_PID"; }
+    fm_afk_launch_stop
+  ' _ "$LAUNCH" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ] && [ ! -e "$st/state/.afk" ] \
+    && printf '%s' "$out" | grep -Fq 'already exited'; then
+    pass "stop race: a daemon that exits mid-stop is reported and the teardown completes"
+  else
+    fail "stop race: stop stood down silently and left away mode half-exited (rc=$rc out=[$out])"
+  fi
+  rm -rf "$st"
+}
+
+# The same race one step earlier: the lock still resolves but its pid file is
+# already gone, which daemon_lock_pid reports as EMPTY output on rc 0, not as a
+# failure. Stop must treat that exactly like a departed daemon - say so, then finish
+# the teardown - rather than silently skipping the fingerprint check and the SIGTERM
+# and clearing away mode with nothing said.
+unit_stop_reports_a_vanished_daemon_lock_pid() {
+  local st out rc
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-stop-empty-pid.XXXXXX")
+  mkdir -p "$st/state"
+  : > "$st/state/.afk"
+  printf 'none\t-\tnative\n' > "$st/state/.afk-daemon-terminal"
+  out=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    daemon_lock_state_resolved() { return 0; }
+    daemon_lock_pid() { printf "\n"; }
+    fm_afk_launch_stop
+  ' _ "$LAUNCH" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ] && [ ! -e "$st/state/.afk" ] \
+    && printf '%s' "$out" | grep -Fq 'lock vanished while stopping'; then
+    pass "stop race: an empty daemon-lock pid is reported and the teardown completes"
+  else
+    fail "stop race: an empty daemon-lock pid tore down silently (rc=$rc out=[$out])"
+  fi
+  rm -rf "$st"
+}
+
+# The other half: a holder that is still ALIVE but cannot be fingerprinted is real
+# ambiguity, not a departed daemon, so it is refused - loudly, naming the lock and
+# the remedy - and no lifecycle state is cleared.
+unit_stop_refuses_unfingerprintable_live_daemon() {
+  local st out rc sleeper_pid
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-stop-unfingerprintable.XXXXXX")
+  mkdir -p "$st/state"
+  : > "$st/state/.afk"
+  printf 'none\t-\tnative\n' > "$st/state/.afk-daemon-terminal"
+  sleep 30 & sleeper_pid=$!
+  out=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" LIVE_PID="$sleeper_pid" bash -c '
+    . "$1"
+    daemon_lock_state_resolved() { return 0; }
+    daemon_lock_pid() { printf "%s\n" "$LIVE_PID"; }
+    fm_pid_identity() { return 1; }
+    fm_afk_launch_stop
+  ' _ "$LAUNCH" 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ] && [ -e "$st/state/.afk" ] && kill -0 "$sleeper_pid" 2>/dev/null \
+    && printf '%s' "$out" | grep -Fq 'cannot fingerprint live away-mode daemon'; then
+    pass "stop race: an unfingerprintable LIVE daemon is refused loudly with state preserved"
+  else
+    fail "stop race: unfingerprintable live daemon rc=$rc out=[$out]"
+  fi
+  kill "$sleeper_pid" 2>/dev/null || true
+  wait "$sleeper_pid" 2>/dev/null || true
+  rm -rf "$st"
+}
+
 unit_stop_surfaces_afk_removal_failure() {
   local st
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-stop-remove.XXXXXX")
@@ -884,6 +1206,15 @@ unit_stop_malformed_record_fails_closed
 unit_tmux_planned_record_and_collision
 unit_stop_validates_before_signal
 unit_lock_requires_complete_metadata
+unit_lock_reclaim_is_loud_when_removal_fails
+unit_lock_reclaim_tolerates_vanished_lock
+unit_launch_lock_holds_on_unreadable_identity
+unit_legacy_daemon_lock_fails_loudly
+unit_legacy_daemon_lock_stops_an_attributed_daemon
+unit_legacy_daemon_lock_start_refreshes_an_attributed_daemon
+unit_stop_completes_when_daemon_exits_mid_stop
+unit_stop_reports_a_vanished_daemon_lock_pid
+unit_stop_refuses_unfingerprintable_live_daemon
 unit_stop_surfaces_afk_removal_failure
 unit_stop_confirms_daemon_exit
 unit_refresh_validates_record

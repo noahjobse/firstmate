@@ -6,7 +6,13 @@
 #   Sets state/.afk unless FM_AFK_STATE_PREPARED=1, checks
 #   state/.supervise-daemon.lock, and:
 #     - prints "afk: daemon already running pid=<pid>" then exits 0 when that
-#       lock is held by a live daemon (a REFRESH: no stale-artifact clear);
+#       lock is held by a live daemon (a REFRESH: no stale-artifact clear), whether
+#       its recorded identity vouches for it or it is instead positively attributed
+#       to this home's daemon script and environment;
+#     - exits NON-ZERO, naming the lock to remove, when the lock is held by a live
+#       pid whose recorded identity this version cannot read and which cannot be
+#       attributed to this home either: never evict it, never start a second daemon
+#       beside it, and never stand down silently;
 #     - otherwise clears any prior away session's stale escalation artifacts
 #       (fm_afk_clear_stale_artifacts) for a direct, non-prepared start, then
 #       execs bin/fm-supervise-daemon.sh in the foreground. A prepared start was
@@ -43,7 +49,7 @@ FM_AFK_DAEMON="$FM_AFK_START_DIR/fm-supervise-daemon.sh"
 . "$FM_AFK_START_DIR/fm-wake-lib.sh"
 
 fm_afk_start_usage() {
-  sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # fm_afk_clear_stale_artifacts: on a FRESH away-session entry (the daemon is not
@@ -81,19 +87,45 @@ daemon_lock_owner() {
   printf '%s\n' "$FM_AFK_LOCK"
 }
 
+# 0 when <pid> is provably the daemon that took this lock, 1 when it is provably a
+# different process, and 2 when the recorded identity cannot be identified at all
+# (fm_pid_matches_identity): a daemon that fingerprinted itself before an in-place
+# update records its identity in a format this code no longer produces.
+#
+# A lock with NO recorded identity predates atomic staging: today's daemon stages a
+# non-empty fingerprint into its owner dir before publishing the lock, or fails to
+# take the lock at all (stage_daemon_lock_meta). Such a holder is attributed the way
+# every other supervisor is - it must be EXECUTING this home's daemon script, and its
+# own environment must resolve to this home and state dir. A substring match over the
+# command line would also vouch for a process that merely NAMES the script (a crewmate
+# whose brief quotes the path, an editor, a tail), which is the `-f`-match hazard
+# AGENTS.md section 8 forbids: callers SIGTERM the pid this vouches for, and reading a
+# recycled pid as the daemon would both kill a stranger and leave away-mode
+# supervision silently unarmed. A live holder that cannot be attributed at all (no
+# /proc, so its home is unreadable) is unidentifiable, never reclaimed.
 daemon_pid_matches() {
-  local pid=$1 owner=$2 identity current command
+  local pid=$1 owner=$2 identity rc=0
   identity=$(cat "$owner/pid-identity" 2>/dev/null || true)
   if [ -n "$identity" ]; then
-    current=$(fm_pid_identity "$pid") || return 1
-    [ "$current" = "$identity" ]
-    return
+    fm_pid_matches_identity "$pid" "$identity" || rc=$?
+    return "$rc"
   fi
-  command=$(ps -p "$pid" -o command= 2>/dev/null || true)
-  case "$command" in
-    *"$FM_AFK_DAEMON"*|*"fm-supervise-daemon.sh"*) return 0 ;;
-  esac
+  daemon_pid_attributed "$pid" && return 0
+  fm_pid_runs_command "$pid" "$FM_AFK_DAEMON" || return 1
+  fm_pid_home_readable "$pid" || return 2
   return 1
+}
+
+# Positively attribute a live pid to THIS home's daemon WITHOUT reading its
+# recorded fingerprint: it must be EXECUTING this home's daemon script, and its own
+# environment must resolve to this home and state dir. This is the same attribution
+# bin/fm-watch-arm.sh requires before it signals a watcher, and it is independent of
+# the identity format, so it still holds across the in-place update that changed it.
+daemon_pid_attributed() {  # <pid>
+  local pid=$1
+  [ -n "$pid" ] || return 1
+  fm_pid_runs_command "$pid" "$FM_AFK_DAEMON" || return 1
+  fm_pid_home_matches "$pid" "$FM_HOME" "$FM_AFK_STATE"
 }
 
 daemon_lock_pid() {
@@ -102,12 +134,51 @@ daemon_lock_pid() {
   cat "$owner/pid" 2>/dev/null || true
 }
 
-daemon_lock_held_by_live_daemon() {
-  local owner pid
+# The lock's three states, mirroring daemon_pid_matches: 0 held by a live,
+# positively identified daemon; 1 no live holder (no lock, a dead pid, or a live
+# pid that is provably not the daemon); 2 a LIVE holder this code cannot identify.
+# Every caller must read all three - a boolean view of this collapses 2 into "no
+# daemon running" and reintroduces the eviction that state exists to prevent.
+# 2 is never reclaimed, never signalled, and never started beside; it is reported
+# loudly instead (fm_afk_ambiguous_lock_message).
+daemon_lock_state() {
+  local owner pid rc=0
   owner=$(daemon_lock_owner) || return 1
   pid=$(cat "$owner/pid" 2>/dev/null || true)
   fm_pid_alive "$pid" || return 1
-  daemon_pid_matches "$pid" "$owner"
+  daemon_pid_matches "$pid" "$owner" || rc=$?
+  return "$rc"
+}
+
+# daemon_lock_state, with its ambiguous state (2) resolved by INDEPENDENT positive
+# attribution instead of by trusting the fingerprint it cannot read. A daemon that
+# fingerprinted itself before the in-place identity-format change is alive, healthy,
+# and still attributable: reporting it as unidentifiable would make every /afk
+# refresh and away-mode recovery hard-fail, telling the captain to remove a lock a
+# LIVE daemon is holding - remediation whose only effect would be a second daemon.
+# So an attributed holder reads as held (0), and only a holder we cannot attribute
+# at all stays 2: never evicted, never signalled, never started beside, and always
+# refused loudly. This is the single lock reader for BOTH halves of /afk; a caller
+# that reads daemon_lock_state directly reintroduces the disagreement.
+daemon_lock_state_resolved() {
+  local rc=0 pid
+  daemon_lock_state || rc=$?
+  [ "$rc" -eq 2 ] || return "$rc"
+  pid=$(daemon_lock_pid 2>/dev/null || true)
+  daemon_pid_attributed "$pid" || return 2
+  printf 'afk: daemon lock identity is unreadable, but live pid=%s runs this home'"'"'s daemon and its own environment resolves to this home; treating it as the running daemon\n' \
+    "$pid" >&2
+  return 0
+}
+
+# Fail-closed must not mean fail-silent: refusing to act on an ambiguous lock is
+# right, but the refusal has to name the exact lock and the exact remedy, or away
+# mode wedges behind a stale lock with nothing telling the captain why.
+fm_afk_ambiguous_lock_message() {  # <refused-action>
+  local pid
+  pid=$(daemon_lock_pid 2>/dev/null || true)
+  printf 'away-mode daemon lock %s is held by live pid=%s whose identity this version cannot read; refusing to %s. If pid %s is not the away-mode daemon, remove %s and retry.\n' \
+    "$FM_AFK_LOCK" "${pid:-unknown}" "$1" "${pid:-unknown}" "$FM_AFK_LOCK"
 }
 
 fm_afk_start_main() {
@@ -124,11 +195,24 @@ fm_afk_start_main() {
     date '+%s' > "$FM_AFK_STATE/.afk"
   fi
 
-  local pid
+  local pid lock_state=0
   pid=$(daemon_lock_pid 2>/dev/null || true)
-  if daemon_lock_held_by_live_daemon; then
+  daemon_lock_state_resolved || lock_state=$?
+  if [ "$lock_state" -eq 0 ]; then
     echo "afk: daemon already running pid=$pid"
     return 0
+  fi
+  # An unidentifiable LIVE holder is treated as still holding the lock. Reading it
+  # as dead would remove its lock and exec a SECOND daemon beside the live one -
+  # duplicate escalations into the captain's session - and "an ambiguous identity
+  # means the holder is gone" is the very assumption that killed a live watcher in
+  # docs/incidents/2026-07-12-torn-watcher-lock.md. Only a holder we can prove is
+  # not the daemon (lock_state 1) is ever reclaimed. Standing down here must still
+  # be LOUD and non-zero: a silent zero would leave bin/fm-afk-launch.sh waiting for
+  # a daemon that is never coming, and away mode would wedge with no explanation.
+  if [ "$lock_state" -eq 2 ]; then
+    echo "afk: $(fm_afk_ambiguous_lock_message 'start a second daemon')" >&2
+    return 1
   fi
 
   if fm_pid_alive "$pid" && [ -n "$pid" ]; then

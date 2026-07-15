@@ -43,7 +43,8 @@ batched digest rather than per-wake injections.
      launch").
    Both paths share `bin/fm-afk-start.sh` as the daemon entry.
    The native path tells it that the launcher already prepared lifecycle state; the terminal-backed path lets the entry perform its existing state setup inside the new terminal.
-   It exits immediately if the identity-backed daemon lock already names a live process, otherwise it execs `bin/fm-supervise-daemon.sh` in the foreground.
+   It exits immediately when the daemon lock is held by a live daemon - whether the lock's recorded identity vouches for it, or the live pid is instead positively attributed to this home's daemon script and environment - otherwise it execs `bin/fm-supervise-daemon.sh` in the foreground.
+   It refuses non-zero, rather than starting a second daemon, when the lock is held by a live pid it can neither identify nor attribute; see "Ambiguous daemon lock" below.
    The daemon is **presence-gated**: it injects escalations only while
    `state/.afk` exists, and stays quiet otherwise.
 
@@ -69,6 +70,18 @@ No `/back` is needed. The first genuine message is the return signal:
 
 Bias ambiguous cases toward exit: a present captain beats token savings, and
 a false exit is self-correcting (the captain re-runs `/afk`).
+
+## Ambiguous daemon lock (fail closed, but never fail silent)
+
+Both halves of `/afk` read the daemon lock in three states, never as a boolean: held by a live daemon, no live holder, or a **live** holder whose recorded identity this version cannot read (it started before the in-place identity-format change of `docs/incidents/2026-07-12-torn-watcher-lock.md`, or `ps` cannot fingerprint it).
+
+- A live holder that is still attributable - it is executing this home's daemon script and its own environment resolves to this home and state dir - is treated as the running daemon: `start` reports it as already running and refreshes `state/.afk`, and `stop` SIGTERMs it normally.
+  A pre-update daemon is handled on this path and needs no intervention.
+- A live holder that cannot be attributed at all is never evicted, never signalled, and never started beside.
+  `bin/fm-afk-launch.sh start` / `start-native` / `stop` / `reconcile` and `bin/fm-afk-start.sh` all exit **non-zero**, naming the exact lock path and the remedy (`AGENTS.md` section 8, "fail-closed must not mean fail-silent").
+
+Treat that refusal as a blocker, exactly as you would an unwritable state dir: it is not contention, and retrying the command changes nothing.
+Away mode is not active - a refused `stop` in particular leaves `state/.afk` in place - so tell the captain away mode could not start or exit, relay the named lock path, and remove that lock only once the named pid is confirmed not to be an away-mode daemon.
 
 ## Orthogonal to approval authority
 
@@ -191,7 +204,11 @@ the marker lets firstmate distinguish it from a real captain message.
 - **Marker strip** - `strip_injection_marker` removes the sentinel prefix before
   classification or relay, so the digest text firstmate sees is clean.
 - **Portable singleton lock** - the daemon uses the repo's portable lock helper
-  (`fm-wake-lib.sh`) instead of `flock`, which is absent on macOS.
+  (`fm-wake-lib.sh`) instead of `flock`, which is absent on macOS. Its identity is
+  staged into the lock before the lock publishes, so the lock is never observable
+  half-written, and a failure to build the lock at all (an unwritable or full state
+  dir) is reported as the daemon's own error rather than as another daemon already
+  running.
 - **Dedupe across signal/stale/scan** - `classify_signal` and `classify_stale`
   both check the seen-status marker before escalating, so a status escalated by
   one path is not re-escalated by another in the same digest.

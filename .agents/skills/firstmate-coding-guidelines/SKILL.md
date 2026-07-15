@@ -77,4 +77,4 @@ Firstmate adds this skill's load instruction to firstmate-repo briefs by hand in
 - Colocate tests with the existing pattern in `tests/`, name them `<subject>.test.sh`, and extend an existing script rather than inventing a new runner.
 - A backend-verification doc (`docs/*-backend.md`) records empirical facts, not assumptions.
 - Include the date, version, exact commands run, and exact output.
-- Write incidents the same way, as evidence, not narrative alone.
+- Write incidents the same way, as evidence, not narrative alone, in a dated record at `docs/incidents/<YYYY-MM-DD>-<slug>.md`, and cross-reference it from the code comments that encode the contract it produced.

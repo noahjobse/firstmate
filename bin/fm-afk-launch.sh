@@ -39,6 +39,17 @@
 # Supported backends: herdr, tmux. Others (zellij, orca, cmux) have no verified
 # non-visible-launch primitive here yet and refuse loudly.
 #
+# Every subcommand reads the daemon lock through the THREE-state
+# daemon_lock_state_resolved, never a boolean: a live holder that is positively
+# attributed to this home (it runs this home's daemon script and its own
+# environment resolves to this home and state dir) is the running daemon even when
+# its recorded identity predates the identity-format change, while a live holder
+# that can be neither identified nor attributed is never evicted, never signalled,
+# and never started beside. That refusal exits NON-ZERO and names the lock and the
+# remedy - fail closed must not mean fail silent (AGENTS.md section 8;
+# docs/incidents/2026-07-12-torn-watcher-lock.md). A refused `stop` therefore
+# leaves state/.afk in place, because away mode was not exited.
+#
 # Test seam: FM_AFK_LAUNCH_ENTRY overrides the command run in the created
 # terminal (default bin/fm-afk-start.sh), so a topology test can run a harmless
 # placeholder instead of a real daemon. FM_SUPERVISOR_TARGET/FM_SUPERVISOR_BACKEND
@@ -67,34 +78,84 @@ set +e
 
 fm_afk_launch_log() { printf 'fm-afk-launch: %s\n' "$*" >&2; }
 
-fm_afk_launch_lock_owned() {
-  local pid expected actual
+# Every read of the daemon lock here goes through daemon_lock_state_resolved's THREE
+# states, never a boolean and never the unresolved daemon_lock_state. A boolean
+# collapses 2 (a LIVE holder this version cannot identify) into "no daemon running",
+# which is how the launcher came to close a live daemon's terminal, spawn a second one
+# beside it, and then wait for a daemon that never arrives - and how stop came to skip
+# the SIGTERM that flushes buffered escalations while state/.afk is still present.
+# Reading the UNRESOLVED state is the mirror-image bug: a live daemon whose legacy
+# fingerprint predates the identity-format change is trivially attributable, so
+# refusing it would hard-fail every /afk refresh and away-mode recovery behind advice
+# to remove a lock its own live daemon holds. Refusing an unattributable holder is
+# right; refusing SILENTLY is not, so every refusal names the lock and the remedy.
+fm_afk_launch_refuse_ambiguous_lock() {  # <refused-action>
+  fm_afk_launch_log "$(fm_afk_ambiguous_lock_message "$1")"
+}
+
+# The launcher lock's three states, mirroring daemon_lock_state: 0 held by a live
+# launcher we positively identify, 1 no live holder (reclaimable), 2 a LIVE holder
+# whose recorded identity is in a format this version cannot read (it started
+# before an in-place update, or ps cannot fingerprint it). The acquire loop REMOVES
+# a lock it reads as unowned, so ambiguity must never read as unowned: evicting a
+# live launcher's lock runs two launchers at once. It must not read as ordinary
+# contention either - waiting for a holder that may never let go is the silent wedge
+# fm_afk_launch_lock_acquire refuses to enter.
+fm_afk_launch_lock_state() {
+  local pid expected rc=0
   [ -d "$FM_AFK_LAUNCH_LOCK" ] || return 1
-  pid=$(cat "$FM_AFK_LAUNCH_LOCK/pid" 2>/dev/null) || return 1
-  expected=$(cat "$FM_AFK_LAUNCH_LOCK/pid-identity" 2>/dev/null) || return 1
-  actual=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
-  [ -n "$expected" ] && [ "$actual" = "$expected" ]
+  pid=$(cat "$FM_AFK_LAUNCH_LOCK/pid" 2>/dev/null || true)
+  [ -n "$pid" ] || return 1
+  fm_pid_alive "$pid" || return 1
+  expected=$(cat "$FM_AFK_LAUNCH_LOCK/pid-identity" 2>/dev/null || true)
+  # A LIVE holder with no readable identity is ambiguous, never reclaimable. Today's
+  # launcher stages its fingerprint before the lock publishes, so it cannot produce
+  # this lock; a lock left by an older launcher can, and reading it as unowned would
+  # evict a live launcher and run two at once.
+  [ -n "$expected" ] || return 2
+  fm_pid_matches_identity "$pid" "$expected" || rc=$?
+  return "$rc"
+}
+
+# Stage hook for the launcher lock: fm_lock_try_create calls this with the owner
+# dir BEFORE the lock symlink publishes it, so the lock a contender reads always
+# carries both a pid and its identity. Publishing the lock first and writing the
+# identity through it afterwards is the torn-lock shape of
+# docs/incidents/2026-07-12-torn-watcher-lock.md: a contender that lands in that
+# window reads an identity-less lock and, once its patience for an incomplete lock
+# runs out, evicts a live launcher.
+fm_afk_launch_stage_lock_meta() {
+  local ownerdir=$1
+  fm_pid_identity "${BASHPID:-$$}" > "$ownerdir/pid-identity" 2>/dev/null || return 1
+  [ -s "$ownerdir/pid-identity" ]
+}
+
+fm_afk_launch_remove_reclaimable_lock() {
+  fm_lock_exists "$FM_AFK_LAUNCH_LOCK" || return 0
+  if fm_lock_remove_path "$FM_AFK_LAUNCH_LOCK" 2>/dev/null; then
+    return 0
+  fi
+  fm_lock_exists "$FM_AFK_LAUNCH_LOCK" || return 0
+  fm_afk_launch_log "launcher lock $FM_AFK_LAUNCH_LOCK is reclaimable but could not be removed; remove $FM_AFK_LAUNCH_LOCK and retry."
+  return 1
 }
 
 fm_afk_launch_lock_acquire() {
-  local i incomplete=0 identity
+  local i incomplete=0 pid lock_state create_rc
   mkdir -p "$FM_AFK_LAUNCH_STATE" || return 1
   for i in $(seq 1 200); do
-    if mkdir "$FM_AFK_LAUNCH_LOCK" 2>/dev/null; then
-      if ! printf '%s' "$$" > "$FM_AFK_LAUNCH_LOCK/pid"; then
-        rm -rf "$FM_AFK_LAUNCH_LOCK"
-        return 1
-      fi
-      identity=$(fm_pid_identity "$$" 2>/dev/null) || {
-        rm -rf "$FM_AFK_LAUNCH_LOCK"
-        return 1
-      }
-      if [ -z "$identity" ] || ! printf '%s' "$identity" > "$FM_AFK_LAUNCH_LOCK/pid-identity"; then
-        rm -rf "$FM_AFK_LAUNCH_LOCK"
-        return 1
-      fi
+    create_rc=0
+    fm_lock_try_create "$FM_AFK_LAUNCH_LOCK" '' fm_afk_launch_stage_lock_meta || create_rc=$?
+    if [ "$create_rc" -eq 0 ]; then
       return 0
     fi
+    if [ "$create_rc" -eq 2 ]; then
+      fm_afk_launch_log "cannot create the launcher lock $FM_AFK_LAUNCH_LOCK (state dir unwritable or full, or ps unavailable)"
+      return 1
+    fi
+    # Only a lock published by an older launcher can be observed half-written; wait
+    # it out rather than judging it, and never let that patience expire into an
+    # eviction - an incomplete lock with a live holder reads as ambiguous below.
     if [ ! -s "$FM_AFK_LAUNCH_LOCK/pid" ] || [ ! -s "$FM_AFK_LAUNCH_LOCK/pid-identity" ]; then
       incomplete=$((incomplete + 1))
       if [ "$incomplete" -lt 20 ]; then
@@ -104,22 +165,29 @@ fm_afk_launch_lock_acquire() {
     else
       incomplete=0
     fi
-    if ! fm_afk_launch_lock_owned; then
-      rm -rf "$FM_AFK_LAUNCH_LOCK" 2>/dev/null || return 1
+    lock_state=0
+    fm_afk_launch_lock_state || lock_state=$?
+    if [ "$lock_state" -eq 2 ]; then
+      pid=$(cat "$FM_AFK_LAUNCH_LOCK/pid" 2>/dev/null || true)
+      fm_afk_launch_log "launcher lock $FM_AFK_LAUNCH_LOCK is held by live pid=${pid:-unknown} whose identity this version cannot read; refusing to evict it. If pid ${pid:-unknown} is not an away-mode launcher, remove $FM_AFK_LAUNCH_LOCK and retry."
+      return 1
+    fi
+    if [ "$lock_state" -ne 0 ]; then
+      fm_afk_launch_remove_reclaimable_lock || return 1
       incomplete=0
       continue
     fi
     sleep 0.05
   done
-  fm_afk_launch_log "timed out waiting for launcher lock"
+  fm_afk_launch_log "timed out waiting for launcher lock $FM_AFK_LAUNCH_LOCK"
   return 1
 }
 
 fm_afk_launch_lock_release() {
   local pid
   pid=$(cat "$FM_AFK_LAUNCH_LOCK/pid" 2>/dev/null || true)
-  [ "$pid" = "$$" ] || return 0
-  rm -rf "$FM_AFK_LAUNCH_LOCK"
+  [ "$pid" = "${BASHPID:-$$}" ] || return 0
+  fm_lock_remove_path "$FM_AFK_LAUNCH_LOCK" 2>/dev/null || true
 }
 
 fm_afk_launch_usage() {
@@ -257,13 +325,21 @@ fm_afk_launch_terminal_alive() {  # <backend> <target>
 }
 
 fm_afk_launch_wait_ready() {  # <backend> <target>
-  local backend=$1 target=$2 i
+  local backend=$1 target=$2 i lock_state
   if [ -n "${FM_AFK_LAUNCH_ENTRY:-}" ]; then
     fm_afk_launch_terminal_alive "$backend" "$target"
     return
   fi
   for i in $(seq 1 100); do
-    daemon_lock_held_by_live_daemon && return 0
+    lock_state=0
+    daemon_lock_state_resolved || lock_state=$?
+    [ "$lock_state" -eq 0 ] && return 0
+    if [ "$lock_state" -eq 2 ]; then
+      # The daemon we just launched stands down on this lock rather than doubling
+      # up, so waiting out the loop would only wait for the terminal to die.
+      fm_afk_launch_refuse_ambiguous_lock 'wait for a daemon to come up behind it'
+      return 1
+    fi
     fm_afk_launch_terminal_alive "$backend" "$target" || return 1
     sleep 0.05
   done
@@ -318,9 +394,16 @@ fm_afk_launch_herdr_recover_created() {  # <session> <label>
 # Reconcile a recorded-but-dead terminal: if a record exists and no live daemon
 # owns it, close the leaked terminal by exact id and drop the record.
 fm_afk_launch_reconcile() {
-  local read_result
-  if daemon_lock_held_by_live_daemon; then
+  local read_result lock_state=0
+  daemon_lock_state_resolved || lock_state=$?
+  if [ "$lock_state" -eq 0 ]; then
     return 0
+  fi
+  if [ "$lock_state" -eq 2 ]; then
+    # The recorded terminal may be the live holder's own; closing it would tear
+    # down a running daemon we cannot even name.
+    fm_afk_launch_refuse_ambiguous_lock 'reconcile the recorded daemon terminal'
+    return 1
   fi
   fm_afk_launch_record_read
   read_result=$?
@@ -436,7 +519,7 @@ fm_afk_launch_create_tmux() {  # <captain-target> <captain-backend>
 }
 
 fm_afk_launch_start() {
-  local captain_target captain_backend backup artifact had_afk=0 result
+  local captain_target captain_backend backup artifact had_afk=0 result lock_state=0
   if [ -e "$FM_AFK_LAUNCH_STATE/.afk-return-catchup" ]; then
     fm_afk_launch_log "return catch-up is still pending; run bin/fm-afk-return.sh check before re-entering away mode"
     return 1
@@ -449,7 +532,12 @@ fm_afk_launch_start() {
 
   mkdir -p "$FM_AFK_LAUNCH_STATE"
 
-  if daemon_lock_held_by_live_daemon; then
+  daemon_lock_state_resolved || lock_state=$?
+  if [ "$lock_state" -eq 2 ]; then
+    fm_afk_launch_refuse_ambiguous_lock 'start a second daemon'
+    return 1
+  fi
+  if [ "$lock_state" -eq 0 ]; then
     fm_afk_launch_record_validate_if_present || return 1
     if ! fm_afk_launch_flag_write; then
       fm_afk_launch_log "failed to refresh away-mode flag"
@@ -505,13 +593,18 @@ fm_afk_launch_start() {
 }
 
 fm_afk_launch_start_native() {
-  local backup artifact had_afk=0 result=0
+  local backup artifact had_afk=0 result=0 lock_state=0
   mkdir -p "$FM_AFK_LAUNCH_STATE" || return 1
   if [ -e "$FM_AFK_LAUNCH_STATE/.afk-return-catchup" ]; then
     fm_afk_launch_log "return catch-up is still pending; run bin/fm-afk-return.sh check before re-entering away mode"
     return 1
   fi
-  if daemon_lock_held_by_live_daemon; then
+  daemon_lock_state_resolved || lock_state=$?
+  if [ "$lock_state" -eq 2 ]; then
+    fm_afk_launch_refuse_ambiguous_lock 'start a second daemon'
+    return 1
+  fi
+  if [ "$lock_state" -eq 0 ]; then
     fm_afk_launch_record_validate_if_present || return 1
     fm_afk_launch_flag_write || return 1
     fm_afk_launch_log "daemon already running; refreshed away-mode flag"
@@ -548,7 +641,7 @@ fm_afk_launch_start_native() {
 }
 
 fm_afk_launch_stop() {
-  local pid pid_identity current_identity result=0 read_result
+  local pid pid_identity current_identity result=0 read_result lock_state=0
   fm_afk_launch_record_read
   read_result=$?
   if [ "$read_result" -eq 2 ]; then
@@ -557,15 +650,48 @@ fm_afk_launch_stop() {
   fi
   # (1) SIGTERM the daemon so its cleanup trap flushes buffered escalations
   # WHILE state/.afk is still present (the exit-ordering fix: clearing .afk
-  # first would make that flush a no-op via inject_msg's presence gate).
+  # first would make that flush a no-op via inject_msg's presence gate). A live
+  # holder must therefore never be left unsignalled just because its lock identity
+  # is unreadable - it would be hard-killed with the terminal instead, losing the
+  # flush. But the recorded pid alone cannot authorise a kill: the OS may have
+  # recycled it onto an unrelated process. So an unidentifiable holder is signalled
+  # only when daemon_lock_state_resolved positively attributes it to this home - it
+  # is executing THIS home's daemon script and its own environment resolves to this
+  # home and state dir, the same attribution bin/fm-watch-arm.sh requires before it
+  # signals a watcher. Anything less is refused loudly, never killed or skipped.
   pid=""
   pid_identity=""
-  if daemon_lock_held_by_live_daemon; then
-    pid=$(daemon_lock_pid 2>/dev/null) || return 1
-    pid_identity=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
+  daemon_lock_state_resolved || lock_state=$?
+  if [ "$lock_state" -eq 2 ]; then
+    fm_afk_launch_refuse_ambiguous_lock 'stop the daemon behind it'
+    return 1
+  fi
+  if [ "$lock_state" -eq 0 ]; then
+    # daemon_lock_pid reports a vanished pid file as EMPTY output on rc 0, not as a
+    # failure, so an empty read must be handled exactly like a failed one: silently
+    # skipping the fingerprint check and the SIGTERM on an empty pid would tear the
+    # terminal down and clear state/.afk having said nothing.
+    pid=$(daemon_lock_pid 2>/dev/null) || pid=""
+    if [ -z "$pid" ]; then
+      fm_afk_launch_log "away-mode daemon lock vanished while stopping; the daemon has already exited, continuing teardown"
+    fi
+  fi
+  # A daemon that exits between the lock read above and these reads is the GOAL
+  # state, not ambiguity: it has already run its own flush. Aborting here would skip
+  # the terminal close and leave state/.afk set, half-exiting away mode with nothing
+  # said - the fail-silent stand-down AGENTS.md section 8 forbids. So a pid that is
+  # no longer alive drops through to teardown with a log, and only a LIVE pid we
+  # cannot fingerprint (ps unavailable) is refused, loudly.
+  if [ -n "$pid" ] && ! pid_identity=$(fm_pid_identity "$pid" 2>/dev/null); then
+    if fm_pid_alive "$pid"; then
+      fm_afk_launch_log "cannot fingerprint live away-mode daemon pid=$pid; refusing to signal it. If pid $pid is not the away-mode daemon, remove $FM_AFK_LOCK and retry."
+      return 1
+    fi
+    fm_afk_launch_log "away-mode daemon pid=$pid already exited; continuing teardown"
+    pid=""
   fi
   if [ -n "$pid" ]; then
-    if ! kill -TERM "$pid" 2>/dev/null; then
+    if ! kill -TERM "$pid" 2>/dev/null && fm_pid_alive "$pid"; then
       fm_afk_launch_log "failed to signal away-mode daemon pid=$pid"
       result=1
     fi

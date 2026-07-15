@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Atomically drain durable watcher wake records, then assert watcher liveness.
+# Contention for the queue lock is waited out, but a state dir this home cannot
+# lock at all is fatal: the queue is NOT drained, and the script says so and exits
+# non-zero rather than blocking forever or draining unlocked.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,7 +43,13 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
+if ! fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"; then
+  # Not contention (which resolves): we cannot build a lock at all and no live
+  # holder exists, so the queue cannot be drained safely. Say so rather than
+  # blocking or draining unlocked.
+  echo "fm-wake-drain: FAILED - could not lock the wake queue in $STATE (state dir unwritable or full); the queue was NOT drained" >&2
+  exit 1
+fi
 DRAIN_LOCK_HELD=true
 
 if [ ! -s "$FM_WAKE_QUEUE" ]; then

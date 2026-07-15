@@ -36,7 +36,12 @@
 #                          status, unless afk is active
 # For normal supervision, resume the session-start primary-harness protocol
 # after each printed reason. Direct duplicate invocations of this script still
-# no-op through the watcher singleton lock.
+# no-op through the watcher singleton lock, printing "watcher: already running"
+# and exiting 0 - but only when a lock actually exists. Failing to build a lock
+# of our own (an unwritable or full state dir, ps unavailable to the identity
+# stage hook) is not contention: it prints "watcher: FAILED" and exits non-zero,
+# because nobody holds the lock and supervision would otherwise be left unarmed
+# while the caller believed it was live.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -581,7 +586,58 @@ if [ "${BASH_SOURCE[0]}" != "$0" ]; then
   return 0
 fi
 
-if ! fm_lock_try_acquire "$WATCH_LOCK"; then
+# Stage this watcher's identity into the owner dir BEFORE the lock is published,
+# so no consumer can ever read a lock that names a live pid but carries no (or
+# another watcher's) identity. Writing this metadata through $WATCH_LOCK after
+# the claim is what tore locks apart and made every guard, arm, and turn-end
+# check misreport a live watcher as absent - see
+# docs/incidents/2026-07-12-torn-watcher-lock.md. Runs in this same main shell,
+# so ${BASHPID:-$$} is the pid fm_lock_prepare_owner records.
+stage_watch_lock_meta() {
+  local ownerdir=$1
+  printf '%s\n' "$FM_HOME" > "$ownerdir/fm-home" || return 1
+  printf '%s\n' "$WATCH_PATH" > "$ownerdir/watcher-path" || return 1
+  fm_pid_identity "${BASHPID:-$$}" > "$ownerdir/pid-identity" 2>/dev/null || return 1
+  [ -s "$ownerdir/pid-identity" ]
+}
+
+watch_lock_is_absent() {
+  ! fm_lock_exists "$WATCH_LOCK"
+}
+
+# True only for a loss that leaves nothing behind: no holder pid was recorded and
+# no lock is on disk. A contender stealing a stale lock removes it before
+# recreating it, so this is ALSO how a benign mid-steal window looks from the
+# loser's side - hence the single retry below before calling it a failure.
+watch_lock_lost_with_nothing_armed() {
+  local rc=$1
+  [ "$rc" -ne 0 ] && [ -z "${FM_LOCK_HELD_PID:-}" ] && watch_lock_is_absent
+}
+
+fm_lock_try_acquire "$WATCH_LOCK" stage_watch_lock_meta
+lock_rc=$?
+if [ "$lock_rc" -eq 1 ] && watch_lock_lost_with_nothing_armed "$lock_rc"; then
+  sleep 0.3
+  fm_lock_try_acquire "$WATCH_LOCK" stage_watch_lock_meta
+  lock_rc=$?
+fi
+if [ "$lock_rc" -eq 2 ]; then
+  # We ended up with no watcher lock and no live holder exists: either we could not
+  # build a lock of our own (unwritable or full state dir, mktemp failing, ps
+  # unavailable to the stage hook), or a lock proved reclaimable could not be
+  # removed - and that case has already named itself and its remedy on stderr. This
+  # is not contention: reporting it as "already running" and exiting zero would leave
+  # supervision silently unarmed while the caller believed it was live.
+  echo "watcher: FAILED - could not take the watcher lock in $STATE and no live watcher holds it (state dir unwritable or full, ps unavailable, or a reclaimable lock that could not be removed - see any message above)" >&2
+  exit 1
+fi
+if watch_lock_lost_with_nothing_armed "$lock_rc"; then
+  # Still nobody holding supervision and nothing armed after a retry, so this is
+  # not the mid-steal window. Never report it as "already running".
+  echo "watcher: FAILED - could not acquire the watcher lock in $STATE and no lock is present; supervision is NOT armed" >&2
+  exit 1
+fi
+if [ "$lock_rc" -ne 0 ]; then
   BEAT="$STATE/.last-watcher-beat"
   if [ -n "${FM_LOCK_HELD_PID:-}" ]; then
     if [ -e "$BEAT" ]; then
@@ -601,13 +657,10 @@ if ! fm_lock_try_acquire "$WATCH_LOCK"; then
   exit 0
 fi
 trap 'fm_lock_release "$WATCH_LOCK"' EXIT
-# This watcher's own pid, as recorded in the lock by fm_lock_claim (which writes
-# ${BASHPID:-$$} from this same main shell). Read directly, never via a command
+# This watcher's own pid, as recorded in the lock by fm_lock_prepare_owner (which
+# writes ${BASHPID:-$$} from this same main shell). Read directly, never via a command
 # substitution, so it matches the stored holder pid for the self-eviction check.
 WATCHER_PID=${BASHPID:-$$}
-printf '%s\n' "$FM_HOME" > "$WATCH_LOCK/fm-home" || true
-printf '%s\n' "$WATCH_PATH" > "$WATCH_LOCK/watcher-path" || true
-fm_pid_identity "$WATCHER_PID" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
 
 [ -e "$STATE/.last-heartbeat" ] || touch "$STATE/.last-heartbeat"
 

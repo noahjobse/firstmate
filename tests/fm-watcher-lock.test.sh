@@ -15,6 +15,14 @@ LIB="$ROOT/bin/fm-wake-lib.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-watcher-lock-tests)
 
+# Restart can only signal a holder it can positively attribute to this home, and
+# that reads the target's own environment through /proc. Where /proc is absent
+# (macOS) the arm deliberately refuses to kill, so the restart-behavior tests
+# below have nothing to assert and skip instead of failing.
+home_attribution_available() {
+  [ -r "/proc/$$/environ" ]
+}
+
 
 test_singleton_start() {
   local dir state fakebin out1 out2 pid1 pid2 live i
@@ -421,6 +429,44 @@ test_watch_restart_rejects_reused_pid() {
   pass "watch restart refuses to signal a reused pid"
 }
 
+test_watch_restart_clears_a_stale_lock_for_a_differently_spelled_home() {
+  # The same stale reused-pid lock as above, but with FM_HOME spelled with a trailing
+  # slash. The lock is genuinely this home's and genuinely stale, and only
+  # clear_stale_recorded_watcher_lock can free it - the live reused pid stops the
+  # fresh watcher from stealing it. A raw string compare of the recorded fm-home
+  # against FM_HOME fails on the spelling, leaves the stale lock in place, and the
+  # home cannot re-arm at all.
+  local dir state fakebin out live pid i lock_pid
+  dir=$(make_case restart-home-spelling)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/restart.out"
+  sleep 300 &
+  live=$!
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$live" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "stale watcher identity" > "$state/.watch.lock/pid-identity"
+  PATH="$fakebin:$PATH" FM_HOME="$dir/" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" --restart > "$out" &
+  pid=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    grep -qF 'watcher: started pid=' "$out" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  { [ -n "$lock_pid" ] && [ "$lock_pid" != "$live" ] && kill -0 "$lock_pid" 2>/dev/null; } \
+    || fail "restart did not clear this home's stale lock when FM_HOME carried a trailing slash (got '$lock_pid')"
+  is_live_non_zombie "$live" || fail "restart killed a reused unrelated pid"
+  kill "$pid" "$lock_pid" "$live" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  pass "watch restart clears its own stale lock for a home spelled with a trailing slash"
+}
+
 test_watch_restart_reports_healthy_peer_without_attaching() {
   local dir state fakebin out peer identity armpid status
   dir=$(make_case restart-healthy-peer)
@@ -438,7 +484,11 @@ test_watch_restart_reports_healthy_peer_without_attaching() {
   touch "$state/.last-watcher-beat"
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_ARM_ATTACH_POLL=0.1 "$WATCH_ARM" --restart > "$out" &
   armpid=$!
-  wait_for_exit "$armpid" 80
+  # The peer ignores TERM on purpose, so restart always burns its full bounded
+  # stop-wait (50 x 0.1s) before it forks and confirms the stand-down child.
+  # The budget must clear that floor with room to spare or a loaded machine times
+  # the arm out before it can report healthy.
+  wait_for_exit "$armpid" 200
   status=$?
   [ "$status" -eq 0 ] || fail "restart did not exit zero after reporting healthy peer (status $status): $(cat "$out")"
   grep -qF "watcher: healthy pid=$peer" "$out" || fail "restart did not report the healthy peer: $(cat "$out")"
@@ -703,8 +753,826 @@ test_pid_identity_is_locale_invariant() {
   pass "fm_pid_identity is locale-invariant across LC_ALL/LC_TIME"
 }
 
+test_pid_identity_is_stable_across_reads() {
+  # The identity is a fingerprint of ONE live process instance, so the same live pid
+  # must fingerprint byte-identically every time or the lock's own holder eventually
+  # reads as a reused pid and supervision reports itself down while a watcher is
+  # running. ps's lstart is NOT stable: it is derived from a btime that jitters, so it
+  # drifts against its own process (docs/incidents/2026-07-12-torn-watcher-lock.md).
+  # The identity is derived from the kernel's own start ticks wherever they are
+  # readable, and this asserts that stability.
+  local live baseline current i
+  sleep 300 &
+  live=$!
+  baseline=$(bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live" 2>/dev/null)
+  [ -n "$baseline" ] || fail "fm_pid_identity produced no identity for a live pid"
+  i=0
+  while [ "$i" -lt 20 ]; do
+    current=$(bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live" 2>/dev/null)
+    [ "$current" = "$baseline" ] \
+      || fail "fm_pid_identity is not stable across reads of one live pid (got '$current', want '$baseline')"
+    sleep 0.1
+    i=$((i + 1))
+  done
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  pass "fm_pid_identity is byte-stable across repeated reads of one live pid"
+}
+
+test_pid_identity_is_derived_from_start_ticks_not_lstart() {
+  # The discriminator behind the incident, asserted directly rather than by the
+  # property it happens to satisfy. `ps -o lstart=` is DERIVED - btime (which is
+  # recomputed and jitters by ~1s on this host, roughly every 30s) plus the process's
+  # own starttime ticks - so every btime jump shifts the derived lstart of EVERY live
+  # process and an lstart fingerprint goes stale against its own process with no
+  # second writer. /proc/<pid>/stat field 22 is boot-relative and carries no btime
+  # term at all, so it cannot move. This pins the fingerprint to field 22 and shows an
+  # lstart-derived one WOULD move across a btime shift, so a future refactor cannot
+  # quietly regress the cure back to lstart. btime cannot be injected, so the shift is
+  # applied to the derivation itself, which is exactly where the drift enters.
+  local live ticks identity head lstart hz derived derived_after_btime_shift
+  if [ ! -r "/proc/$$/stat" ]; then
+    echo "skip: the start-ticks fingerprint needs /proc (Linux)"
+    return 0
+  fi
+  sleep 300 &
+  live=$!
+  ticks=$(bash -c '. "$1"; fm_pid_start_ticks "$2"' _ "$LIB" "$live" 2>/dev/null)
+  identity=$(bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live" 2>/dev/null)
+  head=${identity%%[[:space:]]*}
+  lstart=$(LC_ALL=C ps -p "$live" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  [ -n "$ticks" ] || fail "no start ticks readable for a live pid"
+  [ "$head" = "$ticks" ] \
+    || fail "fm_pid_identity's start half is not /proc/<pid>/stat field 22 (got '$head', want '$ticks')"
+  case "$identity" in
+    "$lstart"*) fail "fm_pid_identity is still lstart-derived, the primitive that drifts" ;;
+  esac
+  # What an lstart-derived fingerprint IS: btime + starttime/HZ. Move btime by the
+  # observed 1s of jitter and it moves with it, while the shipped fingerprint - which
+  # never reads btime - cannot.
+  hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+  derived=$(( $(awk '/^btime /{print $2}' /proc/stat) + ticks / hz ))
+  derived_after_btime_shift=$(( $(awk '/^btime /{print $2}' /proc/stat) + 1 + ticks / hz ))
+  [ "$derived" != "$derived_after_btime_shift" ] \
+    || fail "the lstart derivation did not move across a btime shift; the test cannot discriminate"
+  [ "$(bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live" 2>/dev/null)" = "$identity" ] \
+    || fail "the start-ticks fingerprint moved for a fixed live pid"
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  pass "fm_pid_identity fingerprints from /proc start ticks, immune to the btime shift that moves lstart"
+}
+
+test_lock_metadata_is_staged_before_the_lock_is_published() {
+  # The lock must never be observable in a half-written state. A holder stages its
+  # identity into the OWNER DIR, and only then does the symlink publish it, so no
+  # reader can see a lock that names a live pid but carries no identity (which
+  # every consumer reads as "no watcher"), and no late write can land in another
+  # holder's owner dir and tear the lock apart. Proven by having the stage hook
+  # look for the lock path at the moment it runs: it must still be ABSENT.
+  local dir state lockdir obs out
+  dir=$(make_case lock-stage-atomic)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  obs="$dir/lock-visible-when-staged"
+  out=$(FM_STATE_OVERRIDE="$state" bash -c '
+    LIB=$1; LOCK=$2; OBS=$3
+    . "$LIB"
+    stage_meta() {
+      local ownerdir=$1
+      if [ -e "$LOCK" ] || [ -L "$LOCK" ]; then
+        printf "visible\n" > "$OBS"
+      else
+        printf "absent\n" > "$OBS"
+      fi
+      printf "staged-fingerprint\n" > "$ownerdir/pid-identity"
+    }
+    fm_lock_try_acquire "$LOCK" stage_meta || exit 7
+    printf "staged_at=%s identity=%s\n" "$(cat "$OBS")" "$(cat "$LOCK/pid-identity" 2>/dev/null)"
+  ' _ "$LIB" "$lockdir" "$obs") || fail "staged acquire failed: $out"
+  case "$out" in
+    *"staged_at=absent"*) ;;
+    *) fail "lock was already published when its metadata was staged: $out" ;;
+  esac
+  case "$out" in
+    *"identity=staged-fingerprint"*) ;;
+    *) fail "published lock does not carry the staged identity: $out" ;;
+  esac
+  pass "lock metadata is staged into the owner dir before the lock is published"
+}
+
+test_watch_lock_names_its_own_watcher_from_a_clean_environment() {
+  # The turn-end guard runs from a harness Stop hook, not the operator's shell, so
+  # the predicate must hold with FM_HOME unset and the environment stripped. A live
+  # watcher must read healthy; a killed one must not. Both directions, one test.
+  local dir state fakebin out pid i probe
+  dir=$(make_case lock-clean-env)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1/$2 are the probe shell's own positional args
+  probe='. "$1"; if fm_watcher_healthy "$2/state" "$3" 300 "$2"; then echo healthy; else echo unhealthy; fi'
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$pid" ] && [ -e "$state/.last-watcher-beat" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$pid" ] || fail "watcher did not take the lock"
+  # env -i: no FM_HOME, no FM_STATE_OVERRIDE, nothing inherited from this shell.
+  [ "$(env -i PATH="$PATH" bash -c "$probe" _ "$LIB" "$dir" "$WATCH")" = healthy ] \
+    || fail "live watcher read as absent from a cleared environment (the Stop-hook case)"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  [ "$(env -i PATH="$PATH" bash -c "$probe" _ "$LIB" "$dir" "$WATCH")" = unhealthy ] \
+    || fail "killed watcher still read as healthy - the guard would go silent with supervision off"
+  pass "watcher lock reads healthy for a live watcher and unhealthy for a killed one with FM_HOME unset"
+}
+
+test_restart_stops_a_live_watcher_behind_a_torn_lock() {
+  # The outage regression. A TORN lock - pid naming a live watcher, pid-identity
+  # fingerprinting some other process - makes fm_watcher_lock_matches_pid fail.
+  # Restart must still recognise the live holder as this home's watcher and STOP
+  # it. It must never take the clear-the-lock branch, which would yank the lock
+  # from a watcher that keeps running: that leaves an orphaned watcher racing a
+  # fresh one over a lock neither owns, which is how a false alarm became a real
+  # supervision outage.
+  local dir state fakebin out armout pid armpid i lock_pid stranger
+  home_attribution_available || {
+    echo "skip: restart's home attribution needs /proc (Linux); on macOS restart neither stops nor clears a live holder behind a legacy torn lock"
+    return 0
+  }
+  dir=$(make_case restart-torn-lock)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  armout="$dir/arm.out"
+  # A long poll keeps the seed watcher alive well past the restart, so "it exited"
+  # can only mean restart stopped it, never that it self-evicted on its own.
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=30 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$pid" ] && [ -e "$state/.last-watcher-beat" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$pid" ] || fail "seed watcher did not take the lock"
+  # Tear the lock exactly as an interleaved late write did: keep the live pid, but
+  # replace the identity with a stranger's.
+  sleep 300 &
+  stranger=$!
+  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$stranger" > "$state/.watch.lock/pid-identity"
+  kill "$stranger" 2>/dev/null || true
+  wait "$stranger" 2>/dev/null || true
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" --restart > "$armout" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    grep -qE 'watcher: (started|healthy) pid=' "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  ! is_live_non_zombie "$pid" \
+    || fail "restart left the live watcher running behind a torn lock (orphaned watcher = the real outage)"
+  lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  { [ -n "$lock_pid" ] && [ "$lock_pid" != "$pid" ] && kill -0 "$lock_pid" 2>/dev/null; } \
+    || fail "restart did not leave a live watcher holding the lock (got '$lock_pid')"
+  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_watcher_lock_matches_pid "$2/state" "$3" "$4" "$2"' \
+    _ "$LIB" "$dir" "$WATCH" "$lock_pid" \
+    || fail "lock rebuilt by restart is still not self-consistent (pid does not match its own identity)"
+  kill "$armpid" "$lock_pid" 2>/dev/null || true
+  wait "$armpid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  pass "restart stops a live watcher behind a torn lock instead of orphaning it"
+}
+
+test_restart_never_kills_a_sibling_homes_watcher() {
+  # The cross-home hazard. bin/fm-watch.sh is the SAME script in every firstmate
+  # home, so a stale pid THIS home recorded, recycled by the OS onto a SIBLING
+  # home's live watcher, matches on command path alone. Restart must positively
+  # attribute the pid to this home before signalling it: the sibling's supervision
+  # must survive, and this home must still repair itself.
+  local dir sibling state fakebin armout sibling_pid armpid i lock_pid
+  home_attribution_available || {
+    echo "skip: restart's home attribution needs /proc (Linux); on macOS an unattributable holder is never signalled at all"
+    return 0
+  }
+  dir=$(make_case restart-sibling-home)
+  sibling=$(make_case restart-sibling-home-peer)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/arm.out"
+  # A real watcher, living in ANOTHER home, holding that home's own lock.
+  PATH="$fakebin:$PATH" FM_HOME="$sibling" FM_POLL=30 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$sibling/watch.out" &
+  sibling_pid=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    [ "$(cat "$sibling/state/.watch.lock/pid" 2>/dev/null || true)" = "$sibling_pid" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ "$(cat "$sibling/state/.watch.lock/pid" 2>/dev/null || true)" = "$sibling_pid" ] \
+    || fail "sibling home's watcher did not take its own lock"
+  # THIS home's lock records that pid (recycled), with an identity that no longer
+  # matches it - the exact shape that makes the command-path match the only arm left.
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$sibling_pid" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "stale watcher identity" > "$state/.watch.lock/pid-identity"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" --restart > "$armout" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    grep -qF 'watcher: started pid=' "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  is_live_non_zombie "$sibling_pid" \
+    || fail "restart killed a SIBLING home's watcher off a recycled pid (cross-home kill)"
+  [ "$(cat "$sibling/state/.watch.lock/pid" 2>/dev/null || true)" = "$sibling_pid" ] \
+    || fail "restart disturbed the sibling home's own lock"
+  lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  { [ -n "$lock_pid" ] && [ "$lock_pid" != "$sibling_pid" ] && kill -0 "$lock_pid" 2>/dev/null; } \
+    || fail "restart did not repair this home's supervision with its own live watcher (got '$lock_pid')"
+  grep -F "watcher: started pid=$lock_pid" "$armout" >/dev/null \
+    || fail "restart did not report the fresh watcher it confirmed"
+  kill "$armpid" "$lock_pid" "$sibling_pid" 2>/dev/null || true
+  wait "$armpid" 2>/dev/null || true
+  wait "$sibling_pid" 2>/dev/null || true
+  pass "restart repairs this home without killing a sibling home's watcher"
+}
+
+test_watch_fails_loudly_when_lock_staging_fails() {
+  # A staging failure is OUR failure, not contention: no lock exists and no watcher
+  # is running. The watcher must never report it as "already running" and exit 0,
+  # which would leave supervision unarmed while the caller believed it was live.
+  local dir state fakebin out status
+  dir=$(make_case watch-stage-fail)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  # ps missing makes fm_pid_identity - and so the watcher's stage hook - fail.
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$fakebin/ps"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" 2>&1
+  status=$?
+  [ "$status" -ne 0 ] || fail "watcher exited zero when it could not stage its lock identity: $(cat "$out")"
+  ! grep -qF 'watcher: already running' "$out" \
+    || fail "staging failure was reported as another watcher already running: $(cat "$out")"
+  grep -qF 'watcher: FAILED' "$out" || fail "staging failure was not reported loudly: $(cat "$out")"
+  [ ! -e "$state/.watch.lock" ] || fail "failed staging left a lock behind"
+  pass "watcher fails loudly when it cannot stage its lock identity"
+}
+
+test_lock_acquire_fails_closed_on_an_unwritable_state_dir() {
+  # An unwritable (or full) state dir fails before any staging: mktemp cannot make
+  # the owner dir. That must be the SAME own-failure outcome as a stage failure
+  # (rc 2, no holder pid), never "someone else holds the lock" - and it must never
+  # descend into the steal path, whose lock lives in the same unwritable dir and
+  # would recurse (lock.steal -> lock.steal.steal -> ...) without bound.
+  local dir state out rc
+  [ "$(id -u)" -ne 0 ] || { echo "skip: running as root, an unwritable dir is still writable"; return 0; }
+  dir=$(make_case lock-unwritable-state)
+  state="$dir/state"
+  chmod 500 "$state"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1/$2 are the probe shell's own positional args
+  out=$(timeout 20 env FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_lock_try_acquire "$2/.contend.lock"
+    printf "rc=%s held=[%s] staged_failed=[%s]\n" "$?" "${FM_LOCK_HELD_PID:-}" "${FM_LOCK_STAGE_FAILED:-}"
+  ' _ "$LIB" "$state" 2>&1)
+  rc=$?
+  chmod 700 "$state"
+  [ "$rc" -eq 0 ] || fail "acquire on an unwritable state dir did not terminate cleanly (rc=$rc): $out"
+  case "$out" in
+    *"rc=2 held=[] staged_failed=[1]"*) ;;
+    *) fail "unwritable state dir was not reported as an own failure: $out" ;;
+  esac
+  case "$out" in
+    *"recursion"*|*"FUNCNEST"*) fail "acquire recursed on an unwritable state dir: $out" ;;
+  esac
+  pass "lock acquire fails closed (rc 2, no holder) on an unwritable state dir instead of recursing"
+}
+
+test_unwritable_state_dir_with_a_live_holder_is_contention() {
+  # The other half of the own-failure contract, and the one that can kill a
+  # watcher. An unwritable (or full) state dir fails OUR writes while an existing
+  # holder's lock sits right there, so a live healthy watcher plus a full disk must
+  # read as contention (rc 1, that holder's pid), NEVER as "we could not build a
+  # lock and nothing is running". Reporting that as an own failure is what makes
+  # the watcher print "supervision is NOT armed", the arm report FAILED, and the
+  # repair path (--restart) stop a perfectly healthy watcher because the disk
+  # filled up.
+  local dir state fakebin out out2 pid i status
+  [ "$(id -u)" -ne 0 ] || { echo "skip: running as root, an unwritable dir is still writable"; return 0; }
+  dir=$(make_case unwritable-state-live-holder)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  out2="$dir/watch2.out"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=30 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$pid" ] && [ -e "$state/.last-watcher-beat" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$pid" ] || fail "seed watcher did not take the lock"
+  chmod 500 "$state"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1/$2 are the probe shell's own positional args
+  out=$(timeout 20 env FM_HOME="$dir" bash -c '
+    . "$1"
+    fm_lock_try_acquire "$2/state/.watch.lock"
+    printf "rc=%s held=[%s] staged_failed=[%s]\n" "$?" "${FM_LOCK_HELD_PID:-}" "${FM_LOCK_STAGE_FAILED:-}"
+    fm_watcher_healthy "$2/state" "$3" 300 "$2" && printf "healthy\n"
+  ' _ "$LIB" "$dir" "$WATCH" 2>&1)
+  case "$out" in
+    *"rc=1 held=[$pid] staged_failed=[]"*) ;;
+    *) fail "a live holder on an unwritable state dir was not reported as contention: $out" ;;
+  esac
+  case "$out" in
+    *healthy*) ;;
+    *) fail "a live watcher on an unwritable state dir stopped reading healthy (the repair path would stop it): $out" ;;
+  esac
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 timeout 20 "$WATCH" > "$out2" 2>&1
+  status=$?
+  chmod 700 "$state"
+  [ "$status" -eq 0 ] || fail "watcher did not stand down for the live holder on an unwritable state dir (status=$status): $(cat "$out2")"
+  grep -qF "watcher: already running pid $pid" "$out2" \
+    || fail "watcher did not report the live holder it lost to: $(cat "$out2")"
+  ! grep -qF 'watcher: FAILED' "$out2" \
+    || fail "a live healthy watcher plus an unwritable state dir was reported as a failure to arm: $(cat "$out2")"
+  is_live_non_zombie "$pid" || fail "the healthy holder did not survive the failed acquire"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  pass "an unwritable state dir with a live holder reports contention, not 'nothing armed'"
+}
+
+test_contention_after_a_failed_steal_mutex_reports_no_own_failure() {
+  # The steal mutex is acquired through fm_lock_try_acquire itself, so an
+  # unwritable state dir sets FM_LOCK_STAGE_FAILED inside that recursion. If a live
+  # holder then claims the primary lock, the outer call returns contention - and
+  # must NOT hand the caller an own-failure flag as well: rc 1 always means someone
+  # else holds it, and only rc 2 means we could not build a lock. The probe forces
+  # the race deterministically by making the primary pid read dead once (so we
+  # descend into the steal path) and live afterwards (so a fresh holder appears).
+  local dir state out
+  [ "$(id -u)" -ne 0 ] || { echo "skip: running as root, an unwritable dir is still writable"; return 0; }
+  dir=$(make_case contention-after-failed-steal)
+  state="$dir/state"
+  mkdir -p "$state/.race.lock"
+  printf '4242\n' > "$state/.race.lock/pid"
+  touch -d '-30 seconds' "$state/.race.lock" 2>/dev/null || touch -t 200001010000 "$state/.race.lock"
+  chmod 500 "$state"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1/$2 are the probe shell's own positional args
+  out=$(timeout 20 env FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    alive_calls=0
+    fm_pid_alive() {
+      alive_calls=$((alive_calls + 1))
+      [ "$alive_calls" -gt 1 ]
+    }
+    fm_lock_try_acquire "$2/.race.lock"
+    printf "rc=%s held=[%s] staged_failed=[%s]\n" "$?" "${FM_LOCK_HELD_PID:-}" "${FM_LOCK_STAGE_FAILED:-}"
+  ' _ "$LIB" "$state" 2>&1)
+  chmod 700 "$state"
+  case "$out" in
+    *"rc=1 held=[4242] staged_failed=[]"*) ;;
+    *) fail "contention after a failed steal mutex did not report a clean contention outcome: $out" ;;
+  esac
+  pass "contention never returns with an own-failure flag left over from the steal mutex"
+}
+
+test_unremovable_reclaimable_lock_fails_loudly_never_as_contention() {
+  # A lock proven reclaimable (dead holder, survived the stale recheck) whose
+  # removal fails - a legacy plain-dir lock holding an unexpected file, or a
+  # read-only state dir. Swallowing that failure hands the caller the DEAD holder's
+  # pid as live contention, and the watcher then prints "already running pid <dead>"
+  # and exits zero with supervision unarmed. It must be an own failure (rc 2), and
+  # it must name the lock.
+  local dir state lockdir dead out
+  dir=$(make_case unremovable-reclaimable-lock)
+  state="$dir/state"
+  lockdir="$state/.contend.lock"
+  dead=$(dead_pid)
+  mkdir -p "$lockdir"
+  printf '%s\n' "$dead" > "$lockdir/pid"
+  # An unexpected file the known-file cleanup does not know about, so the rmdir
+  # behind fm_lock_remove_path fails on a lock that is otherwise reclaimable.
+  printf 'x\n' > "$lockdir/unexpected"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1/$2 are the probe shell's own positional args
+  out=$(timeout 20 env FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_lock_try_acquire "$2"
+    printf "rc=%s held=[%s] staged_failed=[%s]\n" "$?" "${FM_LOCK_HELD_PID:-}" "${FM_LOCK_STAGE_FAILED:-}"
+  ' _ "$LIB" "$lockdir" 2>&1)
+  case "$out" in
+    *"rc=2 held=[] staged_failed=[1]"*) ;;
+    *) fail "an unremovable reclaimable lock was not reported as an own failure: $out" ;;
+  esac
+  case "$out" in
+    *"$lockdir"*) ;;
+    *) fail "the refusal did not name the lock that must be removed by hand: $out" ;;
+  esac
+  [ ! -e "$lockdir.steal" ] && [ ! -L "$lockdir.steal" ] \
+    || fail "the steal mutex was left behind after the refusal"
+  pass "a reclaimable lock that cannot be removed fails loudly, never as contention with a dead pid"
+}
+
+test_discard_owner_only_removes_dirs_beside_their_lock() {
+  # The removal paths obtain the owner dir by readlink-ing the lock, so the
+  # recursive remove is aimed at whatever that link names. Only an owner dir minted
+  # beside its own lock may be removed recursively; a matching name somewhere else
+  # on disk must fall back to the conservative cleanup, which leaves a dir holding
+  # anything the lock helpers did not write.
+  local dir state lockdir foreign out
+  dir=$(make_case discard-owner-scope)
+  state="$dir/state"
+  lockdir="$state/.scoped.lock"
+  foreign="$dir/elsewhere/impostor.owner.abcdef"
+  mkdir -p "$foreign"
+  printf 'precious\n' > "$foreign/keepme"
+  ln -s "$foreign" "$lockdir"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1/$2 are the probe shell's own positional args
+  out=$(timeout 20 env FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_lock_remove_path "$2"
+    printf "rc=%s\n" "$?"
+  ' _ "$LIB" "$lockdir" 2>&1)
+  case "$out" in
+    *"rc=0"*) ;;
+    *) fail "removing a lock pointing outside the state dir did not succeed: $out" ;;
+  esac
+  [ ! -e "$lockdir" ] && [ ! -L "$lockdir" ] || fail "the lock symlink itself was not removed"
+  [ -f "$foreign/keepme" ] \
+    || fail "a dir outside the lock's own directory was recursively removed by its name alone"
+  pass "the owner-dir recursive remove is scoped to dirs minted beside their own lock"
+}
+
+test_pid_identity_accepts_a_pre_read_start_ticks() {
+  # fm_pid_matches_identity reads the pid's start ticks once and hands the value to
+  # both the format check and the identity read, so the recorded bytes must be
+  # identical to the ones a caller that passes nothing produces.
+  local dir live from_read passed
+  dir=$(make_case identity-prereak-ticks)
+  if [ ! -r "/proc/$$/stat" ]; then
+    echo "skip: pre-read start ticks need /proc (Linux)"
+    pass "fm_pid_identity accepts a pre-read start ticks (skipped: no /proc)"
+    return
+  fi
+  sleep 30 &
+  live=$!
+  sleep 0.2
+  from_read=$(bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live")
+  passed=$(bash -c '. "$1"; fm_pid_identity "$2" "$(fm_pid_start_ticks "$2")"' _ "$LIB" "$live")
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  [ -n "$from_read" ] || fail "fm_pid_identity produced no identity for a live pid"
+  [ "$passed" = "$from_read" ] \
+    || fail "a pre-read start ticks changed the recorded identity (got '$passed', want '$from_read')"
+  rm -rf "$dir"
+  pass "fm_pid_identity with a pre-read start ticks records byte-identical bytes"
+}
+
+test_owner_dir_leaves_nothing_behind_when_a_stage_hook_writes_extra_files() {
+  # A stage hook may stage any filename into its owner dir. If discard only cleared
+  # a fixed name list, an extra file would defeat the rmdir and strand a
+  # <lock>.owner.XXXXXX dir in the state dir on every acquire - and a state dir that
+  # slowly fills is exactly how the contention case above (a full disk with a live
+  # watcher) comes about in the first place.
+  local dir state out strays
+  dir=$(make_case owner-dir-stage-extra)
+  state="$dir/state"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1/$2 are the probe shell's own positional args
+  out=$(timeout 20 env FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    stage_extra() { printf "x\n" > "$1/unknown-metadata"; }
+    stage_fail() { printf "x\n" > "$1/unknown-metadata"; return 1; }
+    fm_lock_try_acquire "$2/.extra.lock" stage_extra || { echo "acquire-failed"; exit 1; }
+    fm_lock_release "$2/.extra.lock"
+    fm_lock_try_acquire "$2/.extra.lock" stage_fail && { echo "staging-failure-not-reported"; exit 1; }
+    echo ok
+  ' _ "$LIB" "$state" 2>&1)
+  [ "$out" = ok ] || fail "stage-hook probe did not behave as expected: $out"
+  [ ! -e "$state/.extra.lock" ] || fail "a released lock (and a failed staging) left a lock behind"
+  strays=$(find "$state" -maxdepth 1 -name '*.owner.*' | wc -l)
+  [ "$strays" -eq 0 ] || fail "$strays owner dir(s) leaked into the state dir after a stage hook wrote an unknown filename"
+  pass "owner dirs are cleared generically, so a stage hook's own filenames leak nothing"
+}
+
+test_try_create_clears_stale_lock_signals_on_entry() {
+  # fm_lock_try_create is a primitive in its own right, and callers reach it directly.
+  # Its contract is that ONLY an own failure sets FM_LOCK_STAGE_FAILED, so it must
+  # clear the three lock signals on entry: a flag left behind by an earlier failed
+  # acquire would otherwise be read as this call's outcome, which is the stale-signal
+  # class that produced the misclassification outages in the first place.
+  local dir state out
+  dir=$(make_case try-create-clears-signals)
+  state="$dir/state"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1/$2 are the probe shell's own positional args
+  out=$(timeout 20 env FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    FM_LOCK_STAGE_FAILED=1
+    FM_LOCK_HELD_PID=9999
+    fm_lock_try_create "$2/.fresh.lock"
+    printf "fresh rc=%s staged_failed=[%s] held=[%s]\n" "$?" "${FM_LOCK_STAGE_FAILED:-}" "${FM_LOCK_HELD_PID:-}"
+    FM_LOCK_STAGE_FAILED=1
+    FM_LOCK_HELD_PID=9999
+    fm_lock_try_create "$2/.fresh.lock"
+    printf "taken rc=%s staged_failed=[%s] held=[%s]\n" "$?" "${FM_LOCK_STAGE_FAILED:-}" "${FM_LOCK_HELD_PID:-}"
+  ' _ "$LIB" "$state" 2>&1)
+  case "$out" in
+    *"fresh rc=0 staged_failed=[] held=[]"*) ;;
+    *) fail "fm_lock_try_create carried a stale own-failure signal into a successful create: $out" ;;
+  esac
+  case "$out" in
+    *"taken rc=1 staged_failed=[] held=[]"*) ;;
+    *) fail "fm_lock_try_create carried a stale own-failure signal into a contention return: $out" ;;
+  esac
+  pass "fm_lock_try_create clears stale lock signals on entry"
+}
+
+test_watch_fails_loudly_when_the_state_dir_is_unwritable() {
+  # Same cause, seen from the watcher: no lock exists and nothing was armed, so it
+  # must exit non-zero and say so, never "already running".
+  local dir state fakebin out status
+  [ "$(id -u)" -ne 0 ] || { echo "skip: running as root, an unwritable dir is still writable"; return 0; }
+  dir=$(make_case watch-unwritable-state)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  chmod 500 "$state"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 timeout 20 "$WATCH" > "$out" 2>&1
+  status=$?
+  chmod 700 "$state"
+  [ "$status" -ne 124 ] || fail "watcher hung (unbounded recursion?) on an unwritable state dir: $(cat "$out")"
+  [ "$status" -ne 0 ] || fail "watcher exited zero when it could not create its lock: $(cat "$out")"
+  ! grep -qF 'watcher: already running' "$out" \
+    || fail "an unwritable state dir was reported as another watcher already running: $(cat "$out")"
+  grep -qF 'watcher: FAILED' "$out" || fail "unwritable state dir was not reported loudly: $(cat "$out")"
+  [ ! -e "$state/.watch.lock" ] || fail "failed acquire left a lock behind"
+  pass "watcher fails loudly when an unwritable state dir prevents it from creating its lock"
+}
+
+test_pid_runs_command_matches_only_the_program_being_run() {
+  # The restart arm signals what this vouches for, so it must mean "this pid is
+  # EXECUTING that script", not "that path appears somewhere in its arguments" - a
+  # tail or editor on bin/fm-watch.sh must never be mistaken for the watcher.
+  local dir tail_pid sleeper_pid probe
+  dir=$(make_case pid-runs-command)
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1/$2 are the probe shell's own positional args
+  probe='. "$1"; if fm_pid_runs_command "$2" "$3"; then echo match; else echo nomatch; fi'
+  tail -f "$WATCH" > /dev/null 2>&1 &
+  tail_pid=$!
+  sleep 0.2
+  [ "$(FM_STATE_OVERRIDE="$dir/state" bash -c "$probe" _ "$LIB" "$tail_pid" "$WATCH")" = nomatch ] \
+    || fail "a process merely reading $WATCH matched as running it (it would be SIGTERMed off a recycled pid)"
+  kill "$tail_pid" 2>/dev/null || true
+  wait "$tail_pid" 2>/dev/null || true
+  PATH="$dir/fakebin:$PATH" FM_STATE_OVERRIDE="$dir/state" FM_POLL=30 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$dir/watch.out" 2>&1 &
+  sleeper_pid=$!
+  sleep 0.5
+  [ "$(FM_STATE_OVERRIDE="$dir/state" bash -c "$probe" _ "$LIB" "$sleeper_pid" "$WATCH")" = match ] \
+    || fail "the real watcher process did not match its own script path"
+  kill "$sleeper_pid" 2>/dev/null || true
+  wait "$sleeper_pid" 2>/dev/null || true
+  pass "fm_pid_runs_command matches the program being run, not a path in the arguments"
+}
+
+test_pid_runs_command_matches_a_program_path_containing_spaces() {
+  # A home whose path contains a space still runs the same watcher. Word-splitting
+  # the command line truncates such a path, so the arm would read a LIVE watcher as
+  # not running its script, fall through to clearing the lock, and yank it out from
+  # under that watcher - the outage in docs/incidents/2026-07-12-torn-watcher-lock.md.
+  local dir spaced watcher live_pid probe
+  dir=$(make_case pid-runs-command-spaces)
+  spaced="$dir/a home with spaces"
+  watcher="$spaced/fm-watch.sh"
+  mkdir -p "$spaced"
+  cat > "$watcher" <<'SH'
+#!/usr/bin/env bash
+sleep 30
+SH
+  chmod +x "$watcher"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1/$2 are the probe shell's own positional args
+  probe='. "$1"; if fm_pid_runs_command "$2" "$3"; then echo match; else echo nomatch; fi'
+  "$watcher" &
+  live_pid=$!
+  sleep 0.3
+  [ "$(FM_STATE_OVERRIDE="$dir/state" bash -c "$probe" _ "$LIB" "$live_pid" "$watcher")" = match ] \
+    || fail "a live watcher whose path contains a space did not match its own script path"
+  kill "$live_pid" 2>/dev/null || true
+  wait "$live_pid" 2>/dev/null || true
+  tail -f "$watcher" > /dev/null 2>&1 &
+  live_pid=$!
+  sleep 0.2
+  [ "$(FM_STATE_OVERRIDE="$dir/state" bash -c "$probe" _ "$LIB" "$live_pid" "$watcher")" = nomatch ] \
+    || fail "a process merely reading the spaced watcher path matched as running it"
+  kill "$live_pid" 2>/dev/null || true
+  wait "$live_pid" 2>/dev/null || true
+  pass "fm_pid_runs_command matches a program path containing spaces, still not one named in arguments"
+}
+
+test_wake_append_fails_fast_when_the_state_dir_is_unwritable() {
+  # The queue lock cannot be created at all on an unwritable (or full) state dir.
+  # That is permanent, not contention, so waiting on it would block forever and no
+  # wake would ever be queued or surfaced - a silent total supervision failure. It
+  # must fail promptly and loudly instead.
+  local dir state out rc
+  [ "$(id -u)" -ne 0 ] || { echo "skip: running as root, an unwritable dir is still writable"; return 0; }
+  dir=$(make_case wake-append-unwritable-state)
+  state="$dir/state"
+  chmod 500 "$state"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1 is the probe shell's own positional arg
+  out=$(timeout 15 env FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_wake_append signal fm-x "signal: fm-x"
+    printf "rc=%s\n" "$?"
+  ' _ "$LIB" 2>&1)
+  rc=$?
+  chmod 700 "$state"
+  [ "$rc" -ne 124 ] || fail "fm_wake_append hung on an unwritable state dir instead of failing: $out"
+  [ "$rc" -eq 0 ] || fail "the wake-append probe did not terminate cleanly (rc=$rc): $out"
+  case "$out" in
+    *"rc=0"*) fail "fm_wake_append reported success though no wake could be queued: $out" ;;
+  esac
+  case "$out" in
+    *"NOT queued"*) ;;
+    *) fail "fm_wake_append did not report the failure loudly: $out" ;;
+  esac
+  pass "fm_wake_append fails loudly and promptly when the state dir is unwritable"
+}
+
+test_wake_drain_fails_loudly_when_the_state_dir_is_unwritable() {
+  # Same cause, seen from the drain: it must not block forever at the top of a
+  # wake-handling turn.
+  local dir state out status
+  [ "$(id -u)" -ne 0 ] || { echo "skip: running as root, an unwritable dir is still writable"; return 0; }
+  dir=$(make_case wake-drain-unwritable-state)
+  state="$dir/state"
+  chmod 500 "$state"
+  out=$(FM_STATE_OVERRIDE="$state" timeout 15 "$DRAIN" 2>&1)
+  status=$?
+  chmod 700 "$state"
+  [ "$status" -ne 124 ] || fail "fm-wake-drain hung on an unwritable state dir: $out"
+  [ "$status" -ne 0 ] || fail "fm-wake-drain exited zero though it could not lock the queue: $out"
+  case "$out" in
+    *FAILED*) ;;
+    *) fail "fm-wake-drain did not report the failure loudly: $out" ;;
+  esac
+  pass "fm-wake-drain fails loudly when an unwritable state dir prevents locking the queue"
+}
+
+test_pid_home_matches_separates_state_override_domains() {
+  # Two domains can share a home root and differ only by FM_STATE_OVERRIDE, each
+  # with its own .watch.lock. They are different supervision domains and must not
+  # be able to signal each other.
+  local dir peer_pid probe
+  dir=$(make_case home-state-override)
+  mkdir -p "$dir/state-a" "$dir/state-b"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1/$2 are the probe shell's own positional args
+  probe='. "$1"; if fm_pid_home_matches "$2" "$3" "$4"; then echo match; else echo nomatch; fi'
+  FM_HOME="$dir" FM_STATE_OVERRIDE="$dir/state-a" sleep 30 &
+  peer_pid=$!
+  sleep 0.2
+  if [ -r "/proc/$peer_pid/environ" ]; then
+    [ "$(bash -c "$probe" _ "$LIB" "$peer_pid" "$dir" "$dir/state-a")" = match ] \
+      || fail "a process in the same home and state dir was not attributed to it"
+    [ "$(bash -c "$probe" _ "$LIB" "$peer_pid" "$dir" "$dir/state-b")" = nomatch ] \
+      || fail "a process in a DIFFERENT state-override domain was attributed to this one (cross-domain kill)"
+  else
+    echo "skip: home attribution needs /proc (Linux)"
+  fi
+  kill "$peer_pid" 2>/dev/null || true
+  wait "$peer_pid" 2>/dev/null || true
+  pass "fm_pid_home_matches treats a different FM_STATE_OVERRIDE as a different home"
+}
+
+test_pid_home_matches_is_path_representation_independent() {
+  # FM_HOME is whatever the environment spells it as - a trailing slash, a symlink -
+  # while the library's own no-override fallback is physically resolved. A raw
+  # string compare fails a home against its OWN watcher, and restart then treats a
+  # live, attributable watcher as a stranger and yanks its lock instead of stopping
+  # it: the outage this branch exists to eliminate.
+  local dir home link peer_pid probe
+  dir=$(make_case home-path-spelling)
+  home="$dir/home"
+  link="$dir/home-link"
+  mkdir -p "$home/state"
+  ln -s "$home" "$link"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1..$4 are the probe shell's own positional args
+  probe='. "$1"; if fm_pid_home_matches "$2" "$3" "$4"; then echo match; else echo nomatch; fi'
+  FM_HOME="$home" sleep 30 &
+  peer_pid=$!
+  sleep 0.2
+  if [ -r "/proc/$peer_pid/environ" ]; then
+    [ "$(bash -c "$probe" _ "$LIB" "$peer_pid" "$home/" "$home/state")" = match ] \
+      || fail "a trailing-slash FM_HOME was not attributed to its own watcher"
+    [ "$(bash -c "$probe" _ "$LIB" "$peer_pid" "$link" "$link/state")" = match ] \
+      || fail "a symlinked FM_HOME was not attributed to its own watcher"
+    [ "$(bash -c "$probe" _ "$LIB" "$peer_pid" "$dir/other" "$dir/other/state")" = nomatch ] \
+      || fail "normalisation attributed a process to a home that is not its own"
+  else
+    echo "skip: home attribution needs /proc (Linux)"
+  fi
+  kill "$peer_pid" 2>/dev/null || true
+  wait "$peer_pid" 2>/dev/null || true
+  pass "fm_pid_home_matches attributes a home spelled with a trailing slash or through a symlink"
+}
+
+test_watcher_lock_path_compare_is_path_representation_independent() {
+  # The lock's watcher-path and the path the reader was invoked with are two
+  # spellings of one script when the bin dir is reached through a symlink. A raw
+  # compare fails a live watcher against its own lock, and restart then clears
+  # that lock instead of stopping the watcher.
+  local dir state bin_link identity peer_pid probe
+  dir=$(make_case lock-path-spelling)
+  state="$dir/state"
+  bin_link="$dir/bin-link"
+  ln -s "$ROOT/bin" "$bin_link"
+  sleep 30 &
+  peer_pid=$!
+  sleep 0.2
+  identity=$(bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$peer_pid")
+  mkdir -p "$state/.watch.lock"
+  printf '%s\n' "$peer_pid" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$bin_link/fm-watch.sh" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+  # shellcheck disable=SC2016  # single quotes are deliberate: $1..$5 are the probe shell's own positional args
+  probe='. "$1"; if fm_watcher_lock_matches_pid "$2" "$3" "$4" "$5"; then echo match; else echo "rc$?"; fi'
+  [ "$(bash -c "$probe" _ "$LIB" "$state" "$WATCH" "$peer_pid" "$dir")" = match ] \
+    || fail "a watcher-path recorded through a symlinked bin dir was not matched against its own watcher"
+  [ "$(bash -c "$probe" _ "$LIB" "$state" "$ROOT/bin/fm-guard.sh" "$peer_pid" "$dir")" = rc1 ] \
+    || fail "normalisation matched a lock recording a different script"
+  kill "$peer_pid" 2>/dev/null || true
+  wait "$peer_pid" 2>/dev/null || true
+  pass "fm_watcher_lock_matches_pid matches a watcher path spelled through a symlink, and still rejects another script"
+}
+
+test_dead_pid_is_provably_not_the_holder_not_unidentifiable() {
+  # A holder that has simply exited must report 1 (reclaimable), never 2. Format
+  # is inferred from /proc, so a dead pid's missing stat used to look like an
+  # lstart-format host: a ticks identity then read as legacy, and the caller told
+  # the captain to remove by hand a lock that needed no remediation.
+  local dir dead_pid identity rc
+  dir=$(make_case dead-pid-identity)
+  if [ ! -r "/proc/$$/stat" ]; then
+    echo "skip: identity format inference needs /proc (Linux)"
+    pass "fm_pid_matches_identity reports a dead holder as reclaimable (skipped: no /proc)"
+    return
+  fi
+  sleep 30 &
+  dead_pid=$!
+  sleep 0.2
+  identity=$(bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$dead_pid")
+  case "${identity%%[[:space:]]*}" in
+    ''|*[!0-9]*) fail "expected a start-ticks identity on a /proc host, got '$identity'" ;;
+  esac
+  kill "$dead_pid" 2>/dev/null || true
+  wait "$dead_pid" 2>/dev/null || true
+  bash -c '. "$1"; fm_pid_identity_format "$2"' _ "$LIB" "$dead_pid" >/dev/null 2>&1 \
+    && fail "a dead pid's identity format was reported as knowable"
+  rc=0
+  bash -c '. "$1"; fm_pid_matches_identity "$2" "$3"' _ "$LIB" "$dead_pid" "$identity" || rc=$?
+  [ "$rc" -eq 1 ] || fail "a dead holder should be provably not the holder (1), got $rc"
+  rm -rf "$dir"
+  pass "fm_pid_matches_identity reports a dead holder as reclaimable, never as unidentifiable"
+}
+
 test_singleton_start
+test_watcher_lock_path_compare_is_path_representation_independent
+test_dead_pid_is_provably_not_the_holder_not_unidentifiable
 test_pid_identity_is_locale_invariant
+test_pid_identity_is_stable_across_reads
+test_pid_identity_is_derived_from_start_ticks_not_lstart
+test_pid_home_matches_is_path_representation_independent
+test_lock_acquire_fails_closed_on_an_unwritable_state_dir
+test_unwritable_state_dir_with_a_live_holder_is_contention
+test_contention_after_a_failed_steal_mutex_reports_no_own_failure
+test_unremovable_reclaimable_lock_fails_loudly_never_as_contention
+test_discard_owner_only_removes_dirs_beside_their_lock
+test_pid_identity_accepts_a_pre_read_start_ticks
+test_owner_dir_leaves_nothing_behind_when_a_stage_hook_writes_extra_files
+test_try_create_clears_stale_lock_signals_on_entry
+test_watch_fails_loudly_when_the_state_dir_is_unwritable
+test_pid_runs_command_matches_only_the_program_being_run
+test_pid_runs_command_matches_a_program_path_containing_spaces
+test_wake_append_fails_fast_when_the_state_dir_is_unwritable
+test_wake_drain_fails_loudly_when_the_state_dir_is_unwritable
+test_pid_home_matches_separates_state_override_domains
+test_lock_metadata_is_staged_before_the_lock_is_published
+test_restart_never_kills_a_sibling_homes_watcher
+test_watch_fails_loudly_when_lock_staging_fails
+test_watch_lock_names_its_own_watcher_from_a_clean_environment
+test_restart_stops_a_live_watcher_behind_a_torn_lock
 test_stale_watch_lock_reclaimed
 test_live_stale_watch_lock_is_actionable
 test_guard_warnings
@@ -717,6 +1585,7 @@ test_lock_empty_pid_uses_minimum_grace
 test_lock_late_claim_loses_after_recreate
 test_lock_paused_mid_acquire_claim_fails_during_steal
 test_watch_restart_rejects_reused_pid
+test_watch_restart_clears_a_stale_lock_for_a_differently_spelled_home
 test_watch_restart_reports_healthy_peer_without_attaching
 test_watcher_self_evicts_on_lock_takeover
 test_arm_attaches_and_waits_for_live_fresh_watcher

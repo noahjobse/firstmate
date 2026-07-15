@@ -434,10 +434,19 @@ test_pi_wiring() {
   pass ".pi primary extension: tool_call runs the cd-guard alongside the watcher-arm check"
 }
 
+# A convenience check only. It runs whatever shellcheck is first on PATH, while
+# bin/fm-lint.sh pins one exact version and refuses to run under any other, so a
+# green here does not mean the pinned linter is green - bin/fm-lint.sh owns that
+# verdict. When shellcheck is absent this reports skip, never ok, so an absent
+# linter can never read as coverage.
 test_scripts_are_shellcheck_clean() {
+  if ! command -v shellcheck >/dev/null 2>&1; then
+    echo "skip: shellcheck not installed; bin/fm-lint.sh (pinned version) owns the real verdict"
+    return 0
+  fi
   shellcheck "$ROOT/bin/fm-cd-pretool-check.sh" >/dev/null 2>&1 \
     || fail "bin/fm-cd-pretool-check.sh is not shellcheck-clean"
-  pass "bin/fm-cd-pretool-check.sh is shellcheck-clean"
+  pass "bin/fm-cd-pretool-check.sh is shellcheck-clean (unpinned shellcheck; bin/fm-lint.sh is authoritative)"
 }
 
 test_full_acceptance_matrix
