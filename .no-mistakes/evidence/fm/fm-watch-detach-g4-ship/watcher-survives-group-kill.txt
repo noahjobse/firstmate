@@ -1,0 +1,11 @@
+arm confirmation line : watcher: started pid=436741 (beacon fresh)
+arm  pid=436726  pgid=436726
+watcher pid=436741  pgid=436741
+=> watcher is in its OWN process group (detached): 436726 != 436741
+beacon mtime before kill: 1789659910
+>>> sending SIGKILL to the arm's WHOLE process group (-436726), as a misfiring memory guard would
+/home/noah/.no-mistakes/evidence/01M2R0AHVASW7D8WFV8FB60C6Q/watcher-survives-group-kill.sh: line 43: 436726 Killed                  PATH="$fakebin:$PATH" FM_HOME="$home" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=0 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$armout" 2>&1
+arm alive after group kill : no
+watcher alive after group kill (pid 436741): yes
+beacon mtime after 2s   : 1789659911
+=> surviving watcher is STILL beating its liveness beacon
