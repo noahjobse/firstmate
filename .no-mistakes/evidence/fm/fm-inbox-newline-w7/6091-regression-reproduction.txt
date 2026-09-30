@@ -1,0 +1,18 @@
+Issue #6091 regression reproduction: strict line-reading consumer over a steering-inbox record
+Scenario: worker reads state/<id>.inbox/NNN.msg with 'while IFS= read -r line; do ...; done < file'.
+Such a loop never runs its body for a final line that hits EOF before a newline.
+Message enqueued: 'please continue'
+
+### BEFORE FIX (base c35b9a6) - the message is silently dropped
+[PRE-FIX]
+  last line the strict consumer actually processed : '--'
+  record file ends with a trailing newline          : no
+
+### AFTER FIX (target c8eda2e) - the full message survives
+[POST-FIX]
+  last line the strict consumer actually processed : 'please continue'
+  record file ends with a trailing newline          : yes
+
+Interpretation: pre-fix the consumer's last processed line is the '--' separator, so the
+actual steer body 'please continue' is lost. Post-fix the consumer receives 'please continue'
+and the record is newline-terminated, so no steer is silently dropped.

@@ -1,0 +1,7 @@
+$ bash tests/fm-task-inbox.test.sh   (exit 0; showing the four #6091 tests)
+ok - inbox: the fixed write path survives a strict line-reading consumer that drops a legacy record's last line
+ok - inbox: a newly written record ends with exactly one trailing newline
+ok - inbox: a message that itself ends in a newline round-trips byte-exact through the framing newline
+ok - inbox: a legacy record with no framing newline still reads back byte-exact and still dedups
+
+Full suite: 25 tests, exit 0, no failures.
